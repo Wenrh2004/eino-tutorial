@@ -1,0 +1,125 @@
+## Three kinds of "memory" — don't conflate them
+
+"Memory" is a fuzzy word in agents. Eino splits it into three layers, each with a job:
+
+1. **Conversation history (messages)** — the multi-turn dialogue the model sees within one run. It's the fuel of the ReAct loop.
+2. **Session values (key-value)** — structured data passed across steps and nodes, like "current username" or "order id."
+3. **Checkpoint** — persistent state that survives across processes and requests, powering interrupt/resume (Chapter 5).
+
+The first two are this chapter's focus; the third is Chapter 5's. Conflating them is the single most common source of beginner confusion, so let's draw the boundaries first.
+
+<Mermaid title="Three memory layers, three lifetimes" chart={`
+flowchart TB
+  subgraph RUN["one run"]
+    MSG["① Conversation history messages<br/>multi-turn · fuel of the ReAct loop"]
+    KV["② Session values key-value<br/>structured data across steps/nodes"]
+  end
+  subgraph PROC["across processes / requests"]
+    CP["③ Checkpoint<br/>persistent state · interrupt/resume (Ch.5)"]
+  end
+  MSG -.this chapter.-> KV
+  KV ==>|"gone when the run ends"| GONE["lifetime ends with this run"]
+  CP ==>|"survives"| STORE["CheckPointStore (persisted)"]
+`} />
+
+
+## Session: a shared blackboard within one run
+
+Every run (starting from `Runner.Run`) has a `runContext` hung on the `context.Context`, holding a `runSession` internally (<SourceRef path="adk/runctx.go" />). Think of the session as "the shared blackboard for this run": any node, any tool, any middleware can write values to it and read them back.
+
+The ADK exposes four functions to read/write session values (all around <SourceRef path="adk/runctx.go:204" />):
+
+```go
+func GetSessionValues(ctx context.Context) map[string]any          // get all
+func AddSessionValue(ctx context.Context, key string, value any)   // set one
+func AddSessionValues(ctx context.Context, kvs map[string]any)     // set many
+func GetSessionValue(ctx context.Context, key string) (any, bool)  // get one
+```
+
+They're all mutex-guarded, so they're concurrency-safe. A typical use: a tool computes a result, writes it to the session, and a later instruction or another tool reads it:
+
+```go
+// inside some tool
+adk.AddSessionValue(ctx, "order_id", "A1002")
+
+// anywhere afterward
+if v, ok := adk.GetSessionValue(ctx, "order_id"); ok {
+    orderID := v.(string)
+    // ...
+}
+```
+
+At the Runner layer, you can seed values from the start with `WithSessionValues`:
+
+```go
+iter := runner.Query(ctx, "Where's my order?",
+    adk.WithSessionValues(map[string]any{"user": "Alice"}))
+```
+
+## Where the `{placeholders}` in Instruction come from
+
+Remember Chapter 2 said `Instruction` supports `{placeholders}`? Session values are their fuel. The magic lives in the default `GenModelInput` (the `chatmodel.go:167` logic related to <SourceRef path="adk/runctx.go" />):
+
+if the session has values at run time, the default implementation treats `Instruction` as an FString template and formats it with the session values. So:
+
+```go
+Instruction: "You are serving user {user}; the current time is {Time}."
+```
+
+combined with `WithSessionValues({"user": "Alice", "Time": "..."})`, and the system prompt the model receives has `{user}` replaced by `Alice`. This makes "dynamic context injection" declarative — you don't hand-concatenate strings.
+
+<Callout kind="key" title="The design key for this chapter">
+The session is *run-scoped*: it's born with a run and dies with it. That contrasts with a checkpoint's *cross-run survival*. Eino deliberately separates the two — **most state only needs to live for one run**, so it goes in the lightweight session rather than paying for heavyweight persistence every time. Distinguishing "shared within a run" from "persisted across runs" is the key to the ADK's state model.
+</Callout>
+
+## How conversation history is maintained
+
+Conversation history is not in session values — it lives in the underlying ReAct graph's local state, `typedState[M].Messages` (the `react.go:36` state tied to <SourceRef path="adk/runctx.go" />). Its lifecycle:
+
+- The **Init node** appends `input.Messages` (the messages you passed to `Run`) into `st.Messages` as the starting point.
+- Every model output and every tool result is appended to `Messages`.
+- The branch decision (whether to keep looping) reads the *last* entry of `Messages`.
+
+In other words, each turn of the ReAct loop grows the history a bit — which is exactly why the model "remembers" what was said earlier. Chapter 14 walks this graph's topology node by node.
+
+`OutputKey` offers a convenient channel: if the Config sets `OutputKey`, the agent automatically writes its final text into that session key on completion (<SourceRef path="adk/chatmodel.go:303" />). Handy in multi-agent setups — one agent's output is read straight from the session by the next.
+
+## Streaming: from AsyncIterator to SSE
+
+In Chapter 2 we consumed a stream with `GetMessage`. Here we fill in "how to wire it to the web."
+
+The ADK's streaming primitive is the `AsyncIterator` + `AsyncGenerator` pair (<SourceRef path="adk/utils.go:57" />): the producer pushes events with `generator.Send(event)`, the consumer pulls with `iterator.Next()`, sharing one unbounded channel underneath. `ChatModelAgent.Run` simply spins a goroutine that keeps `Send`ing and `Close`s when done.
+
+<Callout kind="note" title="There is no built-in SSE encoder in the ADK">
+A pragmatic heads-up: the ADK does **not** provide an SSE / EventStream encoder. What it gives you is the `AsyncIterator` + `schema.StreamReader` streaming abstraction, leaving the "translate into SSE frames" step to your HTTP layer. That fits Eino's positioning — it runs the agent and its events, and doesn't decide your transport protocol for you.
+</Callout>
+
+Wiring the event stream to SSE is that familiar `Next` loop, just writing content to an HTTP flush:
+
+```go
+iter := runner.Query(ctx, query)
+for {
+    event, ok := iter.Next()
+    if !ok {
+        break
+    }
+    msg, _, err := adk.GetMessage(event)
+    if err != nil || msg == nil {
+        continue
+    }
+    fmt.Fprintf(w, "data: %s\n\n", msg.Content)
+    flusher.Flush()
+}
+```
+
+With `EnableStreaming` on, `event.Output.MessageOutput.IsStreaming` is `true`, and the finer approach is to read each chunk of `MessageStream` and flush character by character for a true typewriter effect. The RAG capstone in Chapter 25 gives a complete web version.
+
+## Chapter summary
+
+- Don't conflate the three memories: **conversation history** (in-run, fed to the model), **session values** (in-run, cross-step KV), **checkpoint** (cross-run persistence, Chapter 5).
+- Read/write the session with the four functions like `GetSessionValue` / `AddSessionValue`, all concurrency-safe; `WithSessionValues` seeds initial values at the Runner layer.
+- `Instruction`'s `{placeholders}` are formatted from session values via the default `GenModelInput`.
+- Conversation history lives in the underlying ReAct graph's `Messages` state, appended each turn; `OutputKey` writes output back to the session.
+- Streaming is built on `AsyncIterator`/`AsyncGenerator`; the ADK ships no SSE encoder — your HTTP layer does the translation.
+
+Next up is the climax of Part I: **interrupts and human-in-the-loop** — the full loop of a tool triggering an interrupt, saving a checkpoint, and resuming.

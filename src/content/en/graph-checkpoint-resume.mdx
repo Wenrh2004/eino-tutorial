@@ -1,0 +1,47 @@
+## Letting a program hit "pause"
+
+Picture an agent about to run a "transfer $10,000" tool, but your business requires **human approval first**. Approval might take seconds or a day. You can't leave a process idling that whole time.
+
+The ideal: run to this point, save all state **to disk**, exit cleanly; when approval returns, continue from the **breakpoint** as if never stopped. That's interrupt / checkpoint / resume. In Eino this is not a bolt-on — it's a **first-class citizen** of the orchestration engine.
+
+<Viz name="checkpoint-resume" />
+
+## An interrupt is not an error, but a legal pause
+
+First mindset shift: `Interrupt` is not an `error`. When a node (e.g. an approval-gated tool) raises `Interrupt` / `StatefulInterrupt` (see <SourceRef path="compose/interrupt.go" />), the engine treats it not as an exception but as "this run should *legally pause* here".
+
+The interrupt family:
+
+- **`Interrupt`** — the basic pause signal.
+- **`StatefulInterrupt`** — pauses while carrying custom state (e.g. the pending transfer's details).
+- **`CompositeInterrupt`** — composes multiple interrupts from deep in the call tree and bubbles them up — the low-level implementation of Chapter 9's "`Interrupted` passes through the tool boundary".
+
+## Checkpoint: serialize the whole run state
+
+Once a node interrupts, the engine packs the **entire run state** to disk (see <SourceRef path="compose/checkpoint.go" />): all channel values (data in flight between nodes) plus each node's state. Serialization uses Go's `gob`, which imposes a pragmatic constraint: **any type that must survive an interrupt has to be gob-encodable**. That's why the ADK's message types are designed so conservatively — they must survive a serialization round-trip.
+
+<Callout kind="note" title="Address: the breakpoint's coordinate">
+Saving state isn't enough; you must know *where to resume*. The checkpoint's **`Address`** is the coordinate — it pinpoints *which node*, at *which layer* of the call tree, paused. On resume the engine uses `Address` to find that node and inject the resume data. Nested agent calls resume layer by layer thanks to `Address`.
+</Callout>
+
+## Resume: continue seamlessly from the breakpoint
+
+After state is persisted the process can exit. When the external condition is met, call the Resume family (see <SourceRef path="compose/resume.go" />):
+
+- **`Resume(id)`** — restore by checkpoint id, inject nothing.
+- **`ResumeWithData(id, data)`** — restore and inject `data` (e.g. "approved + approver note") into the node that paused.
+- **`BatchResumeWithData(...)`** — restore **many** interrupts at once — crucial when a plan has several approval steps.
+
+The engine rehydrates run state by `Address`, feeds the resume data to the interrupted node, and the graph continues — downstream nodes never sense the pause-swap-restore.
+
+<Callout kind="key" title="The design key of this chapter">
+Because cancel and interrupt both happen at **node boundaries** (Chapter 14), and node-boundary state is gob-serializable, "pausing a program" reduces to "serializing one run state". Interrupt / checkpoint / resume is fundamentally about **turning a run's pause point into a storable, addressable, resumable data structure.**
+</Callout>
+
+## This is the foundation of the ADK's HITL
+
+Look back at the HITL you learned to *use* in Chapter 5 — a tool triggers an interrupt, a checkpoint is stored, Resume continues — and now you see its foundation. The ADK invents no new mechanism for HITL; it simply **inherits** the orchestration engine's first-class interrupt capability and wraps a friendly shell around it in agent terms. The upper-layer "human-in-the-loop" is reliable precisely because the lower-layer "pause-as-data" is solid enough.
+
+<Callout kind="tip" title="Try it">
+Open <SourceRef path="compose/checkpoint.go" /> and <SourceRef path="compose/resume.go" />, and find the checkpoint's serialization structure and the `Resume` entry point. Comparing the persist step (step 3) and resume step (step 5) demonstrated above, confirm: which fields are written on save? And on restore, at which step is the resume data injected back into the node?
+</Callout>

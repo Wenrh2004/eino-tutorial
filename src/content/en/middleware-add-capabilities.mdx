@@ -1,0 +1,126 @@
+## Stacking capabilities without touching the core
+
+By now your agent can use a model, call tools, remember, and interrupt/resume. But real projects keep sprouting new needs: let it read and write files, auto-compress an over-long history, plan tasks before executing, dynamically search for the right tool to use…
+
+If you edit `ChatModelAgent`'s core logic for every new need, that type quickly bloats into a monster nobody dares touch. Eino's answer is **middleware**: the core stays fixed, capabilities stack on top layer by layer.
+
+Feel the stacking first:
+
+```go
+agent, _ := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+    Name:        "coder",
+    Instruction: "You are an engineer; you can read/write files and plan tasks.",
+    Model:       chatModel,
+    Handlers: []adk.ChatModelAgentMiddleware{
+        filesystemMW,     // stack: filesystem tools
+        plantaskMW,       // stack: task planning
+        summarizationMW,  // stack: auto-summarize long history
+    },
+})
+```
+
+Not a line of the core agent changed, yet three capabilities grew onto it. This chapter unpacks the "stacking" mechanism.
+
+<Mermaid title="The core stays fixed; capabilities stack layer by layer" chart={`
+flowchart TB
+  REQ["one run"] --> S["summarizationMW<br/>auto-summarize long history"]
+  S --> P["plantaskMW<br/>task planning"]
+  P --> F["filesystemMW<br/>filesystem tools"]
+  F --> CORE["ChatModelAgent core<br/>(not a line changed)"]
+  CORE --> F
+  F --> P
+  P --> S
+`} />
+
+
+## What a middleware is: nine hooks
+
+The modern middleware interface is `TypedChatModelAgentMiddleware[M]` (<SourceRef path="adk/handler.go:139" />), with the default alias `ChatModelAgentMiddleware` (<SourceRef path="adk/handler.go:259" />). It isn't a vague `Handle()`; it opens a seam at **nine key moments** of one agent run:
+
+```go
+type TypedChatModelAgentMiddleware[M MessageType] interface {
+    // Agent level: enter / exit
+    BeforeAgent(...)              // rewrite instruction & tools
+    AfterAgent(...)              // observe on successful finish
+
+    // Model level: around each model call (state is persisted)
+    BeforeModelRewriteState(...)  // edit messages & tool list — do it HERE
+    AfterModelRewriteState(...)   // post-process the model's reply
+
+    // Tool level: wrap one tool execution
+    WrapInvokableToolCall(...)    // sync tool
+    WrapStreamableToolCall(...)   // streaming tool
+    WrapEnhancedInvokableToolCall(...)   // enhanced sync
+    WrapEnhancedStreamableToolCall(...)  // enhanced streaming
+
+    // Model-call level: wrap the model itself
+    WrapModel(...)               // retry, failover, temperature, progress events
+}
+```
+
+The hook names betray the intent. `Before/After` are **observe-and-rewrite** points; `Wrap` are **wrapping** points — you're handed the raw execution endpoint and return a new one wrapped around it. The `Wrap` family embodies the "onion model": your logic wraps the real call, and you get to intervene both before and after it.
+
+<Callout kind="note" title="Edit messages in BeforeModelRewriteState, not WrapModel">
+The source explicitly warns you off in `WrapModel`'s comments: don't edit input messages inside `WrapModel`. Two reasons — (1) `WrapModel` changes are **not persisted into state**, affecting only a single model call; (2) they **break prompt caching**. To edit messages or the tool list, use `BeforeModelRewriteState` (<SourceRef path="adk/handler.go:171" />), whose changes are the source of truth for state. `WrapModel` (<SourceRef path="adk/handler.go:254" />) should only do things "around the model call itself": retries, failover, temperature, streaming progress.
+</Callout>
+
+## Only write the hooks you care about
+
+Nine hooks sounds intimidating, but you'll almost never implement all of them. The trick is to **embed** `TypedBaseChatModelAgentMiddleware[M]` (<SourceRef path="adk/handler.go:261" />), which supplies no-op default implementations for all nine methods:
+
+```go
+type LoggingMW struct {
+    *adk.BaseChatModelAgentMiddleware // embed: get eight no-op defaults for free
+}
+
+// override only the one you actually care about
+func (m *LoggingMW) BeforeModelRewriteState(
+    ctx context.Context,
+    state *adk.ChatModelAgentState,
+    mc *adk.ModelContext,
+) (context.Context, *adk.ChatModelAgentState, error) {
+    log.Printf("about to call model, history len=%d", len(state.Messages))
+    return ctx, state, nil
+}
+```
+
+After embedding, `LoggingMW` satisfies the whole interface automatically; you write only the one method with real logic. This is Go's idiom for "interface default implementations," and the ADK uses it to drive the cost of writing a middleware down to the minimum.
+
+<Callout kind="key" title="The design key for this chapter">
+The essence of middleware is **composition instead of modification**. The core `ChatModelAgent` knows nothing about any capability; it merely calls the hooks at nine fixed moments. Capabilities are split into independent, pluggable, reusable middlewares. This yields three direct benefits: a stable core (adding capability doesn't touch the core), orthogonal capabilities (filesystem and summarization don't know about each other), and order-as-semantics (stacking order decides inner vs. outer wrapping). This is the Open/Closed Principle landing in an agent runtime — open for extension, closed for modification.
+</Callout>
+
+## Order is semantics: first registered, outermost
+
+When several middlewares stack, order is not arbitrary. For the `Wrap` family: **the first-registered middleware is the outermost**. So a request passes through it first, and the response passes through it last — the standard onion model.
+
+There's also a historical wrinkle to know: besides the new `Handlers` (an interface slice), the Config still has a deprecated `Middlewares` struct field. In execution order, **the old `Middlewares` runs entirely before the new `Handlers`**. New code should use only `Handlers`; remember this precedence when you meet old code.
+
+Passing data across middlewares has its own channel: `SetRunLocalValue` (<SourceRef path="adk/handler.go:338" />) / `GetRunLocalValue` (<SourceRef path="adk/handler.go:366" />). They bind a value to "this one Run," and — note — **safely survive interrupt/resume**: the value is serialized into the checkpoint and restored verbatim. That makes middleware state naturally compatible with Chapter 5's HITL mechanism.
+
+## A tour of the built-ins: your capability toolbox
+
+The ADK ships a batch of ready-to-use middlewares under `adk/middlewares/`, each following the same construction pattern (generic `NewTyped[M]` + default `New`). A few high-frequency ones:
+
+- **filesystem** (<SourceRef path="adk/middlewares/filesystem/filesystem.go:395" />): gives the agent a full set of file operations — ls / read / write / edit / glob / grep — and offloads oversized results to avoid blowing up the context. The bedrock for letting an agent "work inside a project."
+- **plantask**: injects a TaskCreate / Get / Update / List toolset so the agent breaks a big task into a checklist and drives it item by item. The skeleton for complex multi-step tasks.
+- **summarization**: auto-summarizes and compresses history once it exceeds a threshold (~160k tokens), squeezing a long conversation back into the context window. A life-extender for long sessions.
+- **skill**: loads skills defined by a `SKILL.md`, with inline / fork / fork_with_context execution modes. Injects reusable "workflows" into the agent.
+- **toolsearch**: injects a `tool_search` meta-tool so the agent **dynamically searches** among hundreds or thousands of tools for the right one, instead of shoving every tool at the model at once.
+
+<Callout kind="note" title="Deprecation note: NewMiddleware vs New">
+You may see `NewMiddleware` in old code (e.g. <SourceRef path="adk/middlewares/filesystem/filesystem.go:173" />); it returns the old `AgentMiddleware` and is deprecated. New code should use `New`, which returns the modern `ChatModelAgentMiddleware` with better context propagation through the `Wrap` hooks. Same capability, different interface generation.
+</Callout>
+
+These built-ins are the best teaching material there is — when you want to go deep on a capability, just read its middleware source: how the nine hooks are used, how state is passed, how events are sent, all in plain sight. Part II Chapter 10 returns to the **design** of middleware — why the hooks are cut this way and how the built-ins are classified. Here you only need to build the "stacking" mindset.
+
+## Chapter summary
+
+- Middleware lets you **add capability without touching the core**: the core calls hooks at nine fixed moments; capabilities are pluggable, independent pieces.
+- Nine hooks at three levels: agent (`Before/AfterAgent`), model (`Before/AfterModelRewriteState`, changes persist), and wrapping (`Wrap*`, onion model).
+- Edit messages in `BeforeModelRewriteState`; `WrapModel` is for retry/failover/events only — don't edit input there.
+- Embed `BaseChatModelAgentMiddleware` for free no-op defaults; write only the hooks you care about.
+- Order is semantics (first registered = outermost); old `Middlewares` runs before new `Handlers`; pass values via `SetRunLocalValue`/`GetRunLocalValue`, which survive interrupt/resume.
+- The built-in filesystem / plantask / summarization / skill / toolsearch form a capability toolbox and a set of learning examples.
+
+Next, we upgrade the single agent into **multi-agent**: getting supervisor and DeepAgent working, and feeling the difference between two composition philosophies firsthand.

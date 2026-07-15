@@ -1,0 +1,119 @@
+## From "using it" to "understanding the design"
+
+In Chapter 6 you learned to stack middleware. This chapter returns to the design level to answer three "whys": why does the ADK have **two** middleware types? Why are the nine hooks cut this way? How do the dozen-plus built-ins classify? Understand these and you can judge "which one to use, which hook to implement, which layer to put logic in."
+
+## Two middleware types: a struct-vs-interface generational split
+
+Open the source and you'll find two middleware kinds coexist in the ADK: the old `AgentMiddleware` (<SourceRef path="adk/chatmodel.go:239" />) is a **struct**, the new `TypedChatModelAgentMiddleware[M]` (<SourceRef path="adk/handler.go:139" />) is an **interface**. This isn't reinventing the wheel — it's a deliberate generational upgrade.
+
+The old struct version looks like this:
+
+```go
+type AgentMiddleware struct {
+    AdditionalInstruction string
+    AdditionalTools       []tool.BaseTool
+    BeforeChatModel func(context.Context, *ChatModelAgentState) error
+    AfterChatModel  func(context.Context, *ChatModelAgentState) error
+    WrapToolCall    compose.ToolMiddleware
+}
+```
+
+It's simple, but the source at <SourceRef path="adk/handler.go:117" /> plainly lists its **ceiling**:
+
+- **Structs are closed**: users can't add new methods to extend it.
+- **The framework only knows its fixed fields**: even if you embed it and add your own methods, the framework can't call them — because `config.Middlewares` is typed `[]AgentMiddleware`, not your type.
+- **Callbacks return only `error`**: they can't modify `context` or pass a modified context downward.
+
+<Callout kind="key" title="The design key for this chapter">
+Upgrading from struct to interface is essentially turning middleware from a **fill-in-the-blanks** exercise into an **open implementation**. The struct version has you fill a few predefined fields (closed, finite); the interface version has you **implement a type** — with arbitrary internal state and methods, and hooks that can return a modified `context` to propagate. This is "program to an interface, not an implementation" landing on a framework extension point: the framework depends only on the interface and hands you full power over "what you can extend it into." The struct version is kept only for backward compatibility; new code uses the interface version.
+</Callout>
+
+## Why hooks returning context matters so much
+
+Every interface-version hook returns `(context.Context, ..., error)` rather than just `error`. That detail is the linchpin of the whole design.
+
+Picture a tracing middleware: in `BeforeModelRewriteState` it stuffs a span into `ctx`, and the subsequent model call and tool executions should all see that span. If a hook couldn't return `ctx`, what you inserted would dead-end there, unable to flow down. The interface version — via "hooks return a new `ctx`, and the `Wrap` chain passes `ctx` along" (<SourceRef path="adk/handler.go:124" />) — lets context flow continuously across the whole call chain. That's something the struct version's `func(...) error` can never do.
+
+## A taxonomy of the nine hooks
+
+Chapter 6 listed the nine hooks; here we build a coordinate grid of "target × timing" to understand the intent behind the cuts:
+
+| Level | Hooks | Kind | Purpose |
+| --- | --- | --- | --- |
+| Agent | `BeforeAgent` / `AfterAgent` | observe·rewrite | rewrite instruction/tools on entry; observe on success |
+| Model | `BeforeModelRewriteState` / `AfterModelRewriteState` | observe·rewrite (**persisted**) | edit messages/tools around each model call; changes go into state |
+| Tool | the four `WrapInvokableToolCall` etc. | wrap | insert logic around one tool execution |
+| Model call | `WrapModel` | wrap | around the model call itself: retry/failover/events |
+
+Three threads reveal the intent behind the cuts:
+
+1. **`Before/After` (hooks) vs `Wrap` (wrapping)**. The former is "get called at a moment," good for observation and state changes; the latter hands you the raw endpoint and you return a new one, good for onion-style logic that intervenes both before and after the call.
+2. **The persistence boundary**. `BeforeModelRewriteState` changes are written into state and affect later iterations; `WrapModel` changes affect only a single call. This boundary decides "where to edit messages" — the source at <SourceRef path="adk/handler.go:254" /> explicitly discourages editing input in `WrapModel`, since it isn't persisted and breaks prompt caching.
+3. **Why four tool hooks**. standard/enhanced × sync/streaming = four `Wrap*ToolCall`. Because tools have two interface generations (raw string vs structured `ToolArgument`) and two execution modes (sync vs streaming), the framework leaves a precise wrapping point for each combination instead of papering over it with one vague hook.
+
+## Execution order: a timeline you must memorize
+
+With multiple middlewares plus the framework's internal logic stacked together, order can't be guessed. The source at <SourceRef path="adk/chatmodel.go:323" /> gives the authoritative **model-call lifecycle** (outermost to innermost):
+
+```text
+1. AgentMiddleware.BeforeChatModel        (old · hook)
+2. ChatModelAgentMiddleware.BeforeModelRewriteState (new · hook, can edit state)
+3. failoverModelWrapper                    (internal · multi-model failover)
+4. retryModelWrapper                       (internal · retry)
+5. eventSenderModelWrapper                 (internal · send model events)
+6. ChatModelAgentMiddleware.WrapModel      (new · wrap, first registered = outermost)
+7. callbackInjectionModelWrapper           (internal · inject callbacks)
+8. Model.Generate/Stream                   ← the actual model call
+9. ChatModelAgentMiddleware.AfterModelRewriteState (new · hook)
+10. AgentMiddleware.AfterChatModel          (old · hook)
+```
+
+<Mermaid title="Model-call lifecycle: old Middlewares wrap new Handlers" chart={`
+flowchart TB
+  subgraph OLD["old AgentMiddleware (outermost)"]
+    B1["1 BeforeChatModel"]
+    subgraph NEW["new Handlers"]
+      B2["2 BeforeModelRewriteState (edits state)"]
+      subgraph INT["framework internal wrappers (onion)"]
+        W1["3 failover → 4 retry → 5 eventSender"]
+        W2["6 WrapModel (first registered = outermost)"]
+        W3["7 callbackInjection"]
+        CALL["8 Model.Generate/Stream ← actual call"]
+        W1 --> W2 --> W3 --> CALL
+      end
+      A2["9 AfterModelRewriteState"]
+    end
+    A1["10 AfterChatModel"]
+  end
+  B1 --> B2 --> INT --> A2 --> A1
+`} />
+
+
+Three disciplines jump out of this diagram:
+
+- **Old `Middlewares` wraps outside new `Handlers`.** `BeforeChatModel` (step 1) runs before `BeforeModelRewriteState` (step 2); symmetrically, `AfterChatModel` (step 10) finishes last. The doc at <SourceRef path="adk/chatmodel.go:320" /> states it: Handlers are processed after Middlewares.
+- **First registered = outermost.** Multiple `WrapModel` in registration order `[A, B, C]` form `A(B(C(model)))` (<SourceRef path="adk/chatmodel.go:349" />). To have something see the original output last, register it innermost — that's exactly how `EventSenderModelWrapper` is used.
+- **Framework internals are on the chain too.** Retry, failover, event-sending aren't scattered `if`s — they're precise wrapper layers slotted between your middlewares. Tool calls have a symmetric lifecycle (<SourceRef path="adk/chatmodel.go:356" />).
+
+<Callout kind="note" title="Passing values across middlewares and across interrupts">
+To pass data between middlewares, even across interrupt/resume, use `SetRunLocalValue` (<SourceRef path="adk/handler.go:338" />) / `GetRunLocalValue` (<SourceRef path="adk/handler.go:366" />). The value binds to "this Run" and is serialized into the checkpoint — so it's naturally compatible with Chapter 5's HITL. To emit a custom event onto the stream, use `SendEvent` (<SourceRef path="adk/handler.go:425" />).
+</Callout>
+
+## Two responsibilities of the built-ins
+
+The built-ins under `adk/middlewares/` aren't a random pile — they split cleanly into two responsibilities:
+
+- **Grant capability (inject tools)**: `filesystem` (<SourceRef path="adk/middlewares/filesystem/filesystem.go:395" />, file read/write/grep/glob), `plantask` (task checklist), `skill` (load SKILL.md), `toolsearch` (dynamic tool search). Their commonality: they **add tools** to the agent, extending "what it can do."
+- **Manage context (rewrite state)**: `summarization` (compress over-long history), `reduction` (two-phase truncate/clear tool output), `agentsmd` (transiently inject Agents.md), `patchtoolcalls` (fix dangling tool calls). Their commonality: they **edit messages** in `Before/AfterModelRewriteState`, managing "what gets fed to the model."
+
+This dichotomy isn't forced on the code — it's what the hook design compels: `BeforeAgent` edits the toolset → naturally the first class; `BeforeModelRewriteState` edits messages → naturally the second. **Capability enters through tools, context is changed through state** — remember this and you can instantly judge which class a new need should become and which hook to implement.
+
+## Chapter summary
+
+- The ADK has two middleware types: old `AgentMiddleware` (struct, closed) and new `TypedChatModelAgentMiddleware[M]` (interface, open). New code uses the interface; the struct exists only for compatibility.
+- The upgrade is essentially "fill-in-the-blanks → open implementation"; interface hooks return `context`, letting it propagate across the whole call chain.
+- Nine hooks split by "level × timing": Agent / Model (persisted) / Tool / Model-call; `Before/After` are hooks, `Wrap*` are onion wraps.
+- Execution order has an authoritative timeline: old Middlewares wraps outside new Handlers, first-registered = outermost, and framework internals (retry/failover/events) are on the chain.
+- Built-ins split into two classes: **grant capability** (inject tools) and **manage context** (rewrite state), matching the two hook groups.
+
+Having understood a single agent's extension model, the next chapter rises to **multi-agent composition patterns**: supervisor, plan-execute, and DeepAgent each embody a philosophy of wiring agents together.

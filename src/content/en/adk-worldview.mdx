@@ -1,0 +1,132 @@
+## A different lens on "agent"
+
+Throughout Part I you treated an agent as "a chat bot that can call tools." That view is enough to get started, but it can't support an understanding of the design. To read Eino's source, you first need a different pair of glasses —
+
+> **An agent is not "an object that answers questions"; it's an "event-stream generator."**
+
+You feed it input, and it doesn't return an answer — it **emits a stream of events**: the model started talking, it called a tool, the tool returned, it wants to hand off to someone else, it needs a human, it finished… each one a bead on the stream. The entire ADK design rests on this view.
+
+<Mermaid title="Agent = event-stream generator" chart={`
+flowchart LR
+  IN["Input"] --> RUN["Agent.Run(ctx, input)"]
+  RUN --> ITER["AsyncIterator<br/>event-stream iterator"]
+  ITER --> E1(["event · model starts talking"])
+  ITER --> E2(["event · calls a tool"])
+  ITER --> E3(["event · tool returns"])
+  ITER --> E4(["event · transfer / interrupt"])
+  ITER --> E5(["event · done"])
+  subgraph BEAD["each bead = AgentEvent"]
+    OUT["Output<br/>message / custom product"]
+    ACT["Action<br/>transfer · exit · interrupt"]
+    ERR["Err<br/>set on error"]
+  end
+  E2 -.-> ACT
+  E1 -.-> OUT
+  E5 -.-> ERR
+`} />
+
+
+## TypedAgent: the whole framework has just three methods
+
+Open <SourceRef path="adk/interface.go:453" /> and you'll be surprised how small the Agent interface is:
+
+```go
+type TypedAgent[M MessageType] interface {
+    Name(ctx context.Context) string
+    Description(ctx context.Context) string
+    Run(ctx context.Context,
+        input *TypedAgentInput[M],
+        options ...AgentRunOption) *AsyncIterator[*TypedAgentEvent[M]]
+}
+```
+
+`Name` and `Description` are identity (especially in multi-agent, where others use your `Description` to decide whether to delegate to you). The real core is just one thing: **`Run` takes input and returns an event-stream iterator.**
+
+Note the return type isn't `(*Response, error)` but `*AsyncIterator[*TypedAgentEvent[M]]`. That one signature nails "Agent = event-stream generator" into the type system. The everyday `Agent` is just an alias of it (<SourceRef path="adk/interface.go:467" />):
+
+```go
+type Agent = TypedAgent[*schema.Message]
+```
+
+<Callout kind="key" title="The design key for this chapter">
+Defining an agent's contract as "input → **event stream**" rather than "input → answer" is the bedrock of every ADK capability. Because the output is a **stream**, intermediate steps (thinking, tool calls, hand-offs) can be surfaced in real time; because each event is **data**, it can be observed, serialized, and restored across processes. An interface that returns only a final answer can never do streaming, interrupt/resume, or multi-agent collaboration — the ADK builds all three "for free" on top of this minimal contract.
+</Callout>
+
+## Events: what's inside an AgentEvent
+
+Each bead on the stream is a `TypedAgentEvent[M]` (<SourceRef path="adk/interface.go:419" />, aliased as `AgentEvent` at <SourceRef path="adk/interface.go:438" />):
+
+```go
+type TypedAgentEvent[M MessageType] struct {
+    AgentName string               // who emitted it
+    RunPath   []RunStep            // path from root to here (framework-managed)
+    Output    *TypedAgentOutput[M] // the product: a message or custom output
+    Action    *AgentAction         // control-flow action (see below)
+    Err       error                // set on error
+}
+```
+
+An event carries either `Output` (produced content), or `Action` (change control flow), or `Err`. `RunPath` records "on which path in the call tree this event happened," used to reconstruct hierarchy when agents nest.
+
+## MessageVariant: one bead, two shapes
+
+The message inside `Output` is carried by a clever type — `TypedMessageVariant[M]` (<SourceRef path="adk/interface.go:73" />). It resolves a tension: **for the same event, sometimes you want "the complete message," sometimes "a stream you watch as it's generated."**
+
+```go
+type TypedMessageVariant[M MessageType] struct {
+    IsStreaming   bool                     // the discriminator
+    Message       M                        // materialized message (when not streaming)
+    MessageStream *schema.StreamReader[M]  // live stream (when streaming)
+    Role          schema.RoleType          // Assistant=model output, Tool=tool result
+    ToolName      string                   // tool name when Role==Tool
+    // ...
+}
+```
+
+`IsStreaming` is the switch: `false` → read `Message`, `true` → read `MessageStream`. That's why in Chapter 2 the same consuming code handled both streaming and non-streaming — the secret is this discriminated union.
+
+It also offers `GetMessage()` (<SourceRef path="adk/interface.go:100" />): when streaming, it concatenates the stream into one complete message before returning, smoothing over the two shapes. The top-level `GetMessage(event)` helper from Chapter 2 (<SourceRef path="adk/utils.go:300" />) wraps it — and it **copies the stream**, so the event's stream is still usable after you consume it.
+
+## Action: turning control flow into data too
+
+The clearest embodiment of the "event-stream" philosophy is `AgentAction` (<SourceRef path="adk/interface.go:357" />). It encodes "what to do next" as data too:
+
+```go
+type AgentAction struct {
+    Exit            bool                   // end the run
+    Interrupted     *InterruptInfo         // interrupt (HITL)
+    TransferToAgent *TransferToAgentAction // hand off to another agent
+    BreakLoop       *BreakLoopAction       // break out of a loop
+    CustomizedAction any
+    // ...
+}
+```
+
+Recall Chapter 5: an interrupt can be serialized into a checkpoint precisely because it's a **data bead** like `Action.Interrupted`, not an `error`. Likewise, `Exit` (built by `NewExitAction()`, <SourceRef path="adk/interface.go:342" />) and `TransferToAgent` (<SourceRef path="adk/interface.go:333" />) are data. Once control flow becomes data, it can be routed, intercepted, logged, and restored — the shared premise of every later mechanism.
+
+<Callout kind="note" title="AsyncIterator: how you consume the event stream">
+The consuming side of the event stream is `AsyncIterator[T]` (<SourceRef path="adk/utils.go:31" />), with a single method `Next() (T, bool)` (<SourceRef path="adk/utils.go:35" />): a `false` second return means the stream ended. The producing side is the paired `AsyncGenerator[T]`; the agent `Send`s events into it, and you `Next` them out one at a time — a standard push/pull decoupling. You already used it in Chapter 2; now you know the type behind it.
+</Callout>
+
+## The generic `[M]`: one skeleton, two message types
+
+You may have noticed every type carries `[M MessageType]`. `MessageType` is a **sealed union** (<SourceRef path="adk/interface.go:43" />):
+
+```go
+type MessageType interface {
+    *schema.Message | *schema.AgenticMessage
+}
+```
+
+It allows exactly two message types and can't be extended from outside. The everyday `Agent` and `AgentEvent` are aliases with `M = *schema.Message`; when you need to handle multimodal agentic messages, the same skeleton switches to `M = *schema.AgenticMessage`. This generification is v0.9's central move — Chapter 12 explains why it's worth it. Here, just remember: **one event-stream skeleton, two possible message types.**
+
+## Chapter summary
+
+- The ADK worldview: **an agent is an event-stream generator**, not a question-answerer. `Run` returns `*AsyncIterator[*TypedAgentEvent[M]]`.
+- `TypedAgent[M]` has just three methods (Name / Description / Run); `Agent` is the `M=*schema.Message` alias.
+- `AgentEvent` carries one of `Output` / `Action` / `Err`; `RunPath` records the call path.
+- `MessageVariant` uses the `IsStreaming` discriminator to unify "complete message" and "live stream" for one event; `GetMessage()` smooths the difference.
+- `AgentAction` encodes `Exit` / `Interrupted` / `TransferToAgent` / `BreakLoop` as **data** — the shared bedrock of streaming, interrupt/resume, and multi-agent.
+- The generic `[M MessageType]` is a sealed union: one skeleton supporting `*schema.Message` and `*schema.AgenticMessage`.
+
+With the "Agent = event-stream generator" key in hand, the next chapter charges straight into the book's climax — when one agent must hand work to another, should control flow *transfer*, or be *wrapped as a tool* (agent-as-tool)? That's a head-on clash of two worldviews.

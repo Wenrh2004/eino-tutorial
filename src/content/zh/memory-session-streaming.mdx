@@ -1,0 +1,125 @@
+## 三种「记忆」,别混为一谈
+
+「记忆」在 Agent 里是个含糊的词。Eino 把它拆成三层,各司其职:
+
+1. **会话历史(messages)**——同一次运行里,模型看到的多轮对话。它是 ReAct 循环的燃料。
+2. **Session 值(key-value)**——跨步骤、跨节点传递的结构化数据,比如「当前用户名」「订单号」。
+3. **Checkpoint**——跨进程、跨请求存活的持久化状态,支撑中断/续跑(第 5 章)。
+
+前两层是本章的主角,第三层留给第 5 章。混淆它们是新手最常见的困惑源,先把边界划清。
+
+<Mermaid title="三层记忆,三种生命周期" chart={`
+flowchart TB
+  subgraph RUN["一次运行（run）"]
+    MSG["① 会话历史 messages<br/>多轮对话 · ReAct 循环的燃料"]
+    KV["② Session 值 key-value<br/>跨步骤/节点的结构化数据"]
+  end
+  subgraph PROC["跨进程 / 跨请求"]
+    CP["③ Checkpoint<br/>持久化状态 · 中断/续跑（第 5 章）"]
+  end
+  MSG -.本章.-> KV
+  KV ==>|"运行结束即消失"| GONE["生命周期止于本次运行"]
+  CP ==>|"存活"| STORE["CheckPointStore（持久化）"]
+`} />
+
+
+## Session:一个运行内的共享黑板
+
+每次运行(从 `Runner.Run` 开始)都有一个 `runContext`,它挂在 `context.Context` 里,内部持有一个 `runSession`(<SourceRef path="adk/runctx.go" />)。你可以把 session 想成「这次运行的共享黑板」:任何节点、任何工具、任何中间件都能往上写值、读值。
+
+ADK 暴露了四个函数来读写 session 值(都在 <SourceRef path="adk/runctx.go:204" /> 一带):
+
+```go
+func GetSessionValues(ctx context.Context) map[string]any          // 取全部
+func AddSessionValue(ctx context.Context, key string, value any)   // 写一个
+func AddSessionValues(ctx context.Context, kvs map[string]any)     // 写一批
+func GetSessionValue(ctx context.Context, key string) (any, bool)  // 取一个
+```
+
+它们内部都由互斥锁保护,所以并发安全。典型用法:一个工具算出了结果,写进 session,后面的指令或另一个工具就能读到:
+
+```go
+// 在某个工具里
+adk.AddSessionValue(ctx, "order_id", "A1002")
+
+// 后续任何地方
+if v, ok := adk.GetSessionValue(ctx, "order_id"); ok {
+    orderID := v.(string)
+    // ...
+}
+```
+
+在 Runner 层,你可以用 `WithSessionValues` 一开始就把值种进去:
+
+```go
+iter := runner.Query(ctx, "我的订单到哪了?",
+    adk.WithSessionValues(map[string]any{"user": "Alice"}))
+```
+
+## Instruction 里的 `{占位符}` 从哪来
+
+还记得第 2 章说 `Instruction` 支持 `{占位符}` 吗?它的燃料就是 session 值。这套魔法藏在默认的 `GenModelInput`(<SourceRef path="adk/runctx.go" /> 相关的 `chatmodel.go:167`)里:
+
+如果运行时 session 里有值,默认实现会把 `Instruction` 当作一个 FString 模板,用 session 值去格式化它。所以:
+
+```go
+Instruction: "你在为用户 {user} 服务,当前时间 {Time}。"
+```
+
+配合 `WithSessionValues({"user": "Alice", "Time": "..."})`,模型收到的系统提示里 `{user}` 就被替换成了 `Alice`。这让「动态上下文注入」变得声明式——你不必手动拼字符串。
+
+<Callout kind="key" title="本章的设计钥匙">
+Session 是「运行作用域」的:它随一次运行而生、随之而灭。这与 checkpoint 的「跨运行存活」形成对照。Eino 刻意区分这两者——**大多数状态其实只需要活在一次运行里**,把它们放进轻量的 session,而不是每次都走重量级的持久化。分清「运行内共享」与「跨运行持久化」,是理解 ADK 状态模型的关键。
+</Callout>
+
+## 会话历史是怎么维护的
+
+会话历史不在 session 值里,而在底层 ReAct 图的局部状态 `typedState[M].Messages` 中(<SourceRef path="adk/runctx.go" /> 对应的 `react.go:36`)。它的生命周期是:
+
+- **Init 节点**把 `input.Messages`(你传给 `Run` 的消息)追加进 `st.Messages`,作为起点。
+- 每轮模型输出、每次工具结果,都会被追加进这个 `Messages`。
+- 分叉判断(要不要继续循环)读的是 `Messages` 里的最后一条。
+
+也就是说,ReAct 循环每转一圈,历史就长一截——这正是模型「记得」前面说过什么的原因。第 14 章会把这张图的拓扑逐节点讲清。
+
+`OutputKey` 提供了一条便捷通道:如果 Config 里设了 `OutputKey`,Agent 会在结束时自动把最终文本写进 session 的对应键(<SourceRef path="adk/chatmodel.go:303" />)。这在多智能体里很有用——一个 Agent 的输出,下一个 Agent 直接从 session 读。
+
+## 流式输出:从 AsyncIterator 到 SSE
+
+第 2 章我们用 `GetMessage` 消费了流。这里补上「怎么把它接到 Web」。
+
+ADK 的流式基元是 `AsyncIterator` + `AsyncGenerator` 这一对(<SourceRef path="adk/utils.go:57" />):生产者用 `generator.Send(event)` 推事件,消费者用 `iterator.Next()` 拉事件,底层共享一个无界 channel。`ChatModelAgent.Run` 就是起一个 goroutine 不断 `Send`,跑完 `Close`。
+
+<Callout kind="note" title="ADK 里没有内置 SSE 编码器">
+一个务实的提醒:ADK **没有** 提供 SSE / EventStream 的编码器。它给你的是 `AsyncIterator` + `schema.StreamReader` 这套流式抽象,把「翻译成 SSE 报文」这一步留给你的 HTTP 层。这符合 Eino 的定位——它管 Agent 的运行与事件,不替你决定传输协议。
+</Callout>
+
+把事件流接成 SSE,骨架就是那个熟悉的 `Next` 循环,只是把内容写进 HTTP flush:
+
+```go
+iter := runner.Query(ctx, query)
+for {
+    event, ok := iter.Next()
+    if !ok {
+        break
+    }
+    msg, _, err := adk.GetMessage(event)
+    if err != nil || msg == nil {
+        continue
+    }
+    fmt.Fprintf(w, "data: %s\n\n", msg.Content)
+    flusher.Flush()
+}
+```
+
+如果开了 `EnableStreaming`,`event.Output.MessageOutput.IsStreaming` 会是 `true`,此时更精细的做法是直接读 `MessageStream` 的每个 chunk,逐字 flush,做出真正的打字机效果。第 25 章的 RAG capstone 会给出一个完整的 Web 版本。
+
+## 本章小结
+
+- 三种记忆别混:**会话历史**(运行内、喂给模型)、**Session 值**(运行内、跨步骤 KV)、**Checkpoint**(跨运行持久化,第 5 章)。
+- Session 用 `GetSessionValue` / `AddSessionValue` 等四个函数读写,并发安全;`WithSessionValues` 可在 Runner 层种入初值。
+- `Instruction` 的 `{占位符}` 由 session 值经默认 `GenModelInput` 格式化而来。
+- 会话历史活在底层 ReAct 图的 `Messages` 状态里,每轮追加;`OutputKey` 可把输出写回 session。
+- 流式基于 `AsyncIterator`/`AsyncGenerator`;ADK 不内置 SSE 编码器,由你的 HTTP 层完成翻译。
+
+下一章进入 Part I 的高潮:**中断与人在回路**——工具触发中断、存 checkpoint、Resume 续跑的完整闭环。

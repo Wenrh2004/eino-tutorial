@@ -1,0 +1,62 @@
+## 一次工程决策，两种世界观
+
+当一个主 Agent 需要「把一部分工作交给另一个 Agent」时，Eino 给了你两条路。它们看起来只是 API 的差别，实则是两种关于「控制流该属于谁」的世界观之争。这一章是整本教程的高潮——因为 Eino 对这个问题的回答，几乎决定了它全部的上层设计。
+
+先用下面的演示建立直觉，再逐层拆开源码。
+
+<Viz name="agent-tool-vs-transfer" />
+
+## 路线一：Transfer —— 控制权跳转
+
+Transfer 的心智模型是「交棒」：主 Agent 决定不再自己处理，把控制权**直接跳转**给子 Agent。两者共享同一个 session——同一份消息历史、同一份状态。
+
+这带来一个诱人的好处：子 Agent 能看到完整上下文，无需重新传参。但代价藏在控制流里。
+
+<Callout kind="warning" title="官方为什么标注 NOT RECOMMENDED">
+在 <SourceRef path="adk/interface.go:330" /> 的注释里，transfer 相关能力被明确标注为 **NOT RECOMMENDED**。原因不是它「不能用」，而是它把子 Agent 的控制流事件（`Exit`、`Transfer`、中断）全都作用在这条共享的控制流上。父级既难以隔离子级的副作用，也难以在子级中断后干净地恢复自己的状态。
+</Callout>
+
+共享 session 意味着：子 Agent 里的一次 `Exit` 会结束整个运行，一次再 `Transfer` 会让控制权继续漂移。对于「谁现在在负责」这个问题，答案变得难以静态推断。
+
+## 路线二：Agent-as-Tool —— 组合而非跳转
+
+第二条路线把子 Agent 包装成一个**普通工具**。主 Agent 眼里没有「另一个 Agent」，只有「一个可以调用的工具」。这正是 `DeepAgent` 等预置范式采用的方式，实现落在 <SourceRef path="adk/agent_tool.go" />。
+
+关键差别有两点：
+
+1. **隔离的 session**。子 Agent 在自己的会话里独立运行，父子历史互不污染。父级只拿到工具的返回值，而不是子级的全部内心戏。
+2. **控制流在边界被收敛**。子 Agent 内部的 `Exit` / `Transfer` / `BreakLoop`,在工具边界被「吞掉」——它们只被解释为「这次工具调用结束了」，不会外溢去影响父级的控制流。
+
+<Callout kind="key" title="本章的设计钥匙">
+`agent-as-tool` 把「子 Agent 的控制流」降维成「一次工具调用的返回」。控制流被一道边界封装，于是 Agent 重新变得**可组合**——你可以把一个 Agent 塞进另一个 Agent，像搭积木一样，而不必担心内部的 `Exit` 会掀翻整张桌子。
+</Callout>
+
+## 唯一的例外：中断必须穿透
+
+如果所有控制流事件都被边界吞掉，人在回路（HITL）就没法工作了——子 Agent 里的一次「等待人工审批」的中断，如果在工具边界被吞掉，父级就永远不知道自己该暂停并持久化状态。
+
+所以 Eino 做了一个精确的例外：**`Interrupted` 会穿透边界向上冒泡**。它通过 `CompositeInterrupt` 逐层向上组合（见 <SourceRef path="adk/interface.go:346" />），让父级的 checkpoint 能够覆盖**整棵调用树**。
+
+这就是为什么第二条路线不只是「更干净」，而是「功能更强」：
+
+| 维度 | Transfer（共享 session） | Agent-as-Tool（隔离） |
+| --- | --- | --- |
+| 上下文可见性 | 全暴露 | 按需返回 |
+| `Exit` / `Transfer` | 影响共享控制流 | 边界吸收 |
+| 中断 / 续跑 | 难以隔离恢复 | `Interrupted` 穿透，可组合 checkpoint |
+| 可组合性 | 弱 | 强 |
+| 官方建议 | NOT RECOMMENDED | 推荐 |
+
+## 把哲学连起来
+
+Eino 的许多设计,单独看都只是「一个 API 选择」,连起来看才是一以贯之的哲学:
+
+- **Agent 是事件流生成器**（第 8 章）——所以子 Agent 的输出天然能被当作工具返回值来消费。
+- **组合优于跳转**（本章）——所以隔离边界成为默认。
+- **中断是一等公民**（第 23 章）——所以边界必须为 `Interrupted` 开一道口子。
+
+理解了这一章，你就拿到了阅读 ADK 全部源码的钥匙:每当看到一处「边界」,先问一句——**它吞掉了什么,又放过了什么?**
+
+<Callout kind="tip" title="动手">
+打开 <SourceRef path="adk/agent_tool.go" />,找到 `typedAgentTool` 适配 `tool.BaseTool` 的地方,对照本章演示的第 6、7 步,看看它是如何区分「吞掉 Exit」与「放过 Interrupted」的。第 16 章会逐行剖析这段实现。
+</Callout>

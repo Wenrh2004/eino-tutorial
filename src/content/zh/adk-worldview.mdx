@@ -1,0 +1,132 @@
+## 换一个视角看 Agent
+
+Part I 里,你一直把 Agent 当成"一个会调工具的对话机器人"。这个视角够用来上手,但撑不起对设计的理解。要读懂 Eino 的源码,得先换一副眼镜——
+
+> **一个 Agent 不是一个"会回答问题的对象",而是一个"事件流生成器"。**
+
+你给它输入,它不是返回一个答案,而是**吐出一串事件**:模型开始说话了、调了个工具、工具返回了、要转交给别人了、需要人工介入了、结束了……每一个都是流里的一颗珠子。整个 ADK 的设计,都建立在这个视角上。
+
+<Mermaid title="Agent = 事件流生成器" chart={`
+flowchart LR
+  IN["输入<br/>Input"] --> RUN["Agent.Run(ctx, input)"]
+  RUN --> ITER["AsyncIterator<br/>事件流迭代器"]
+  ITER --> E1(["事件 · 模型开始说话"])
+  ITER --> E2(["事件 · 调用工具"])
+  ITER --> E3(["事件 · 工具返回"])
+  ITER --> E4(["事件 · 转交 / 中断"])
+  ITER --> E5(["事件 · 结束"])
+  subgraph BEAD["每颗珠子 = AgentEvent"]
+    OUT["Output<br/>消息 / 自定义产出"]
+    ACT["Action<br/>转交 · 退出 · 中断"]
+    ERR["Err<br/>出错置位"]
+  end
+  E2 -.-> ACT
+  E1 -.-> OUT
+  E5 -.-> ERR
+`} />
+
+
+## TypedAgent:整个框架只有三个方法
+
+打开 <SourceRef path="adk/interface.go:453" />,你会惊讶于 Agent 的接口有多小:
+
+```go
+type TypedAgent[M MessageType] interface {
+    Name(ctx context.Context) string
+    Description(ctx context.Context) string
+    Run(ctx context.Context,
+        input *TypedAgentInput[M],
+        options ...AgentRunOption) *AsyncIterator[*TypedAgentEvent[M]]
+}
+```
+
+`Name` 和 `Description` 是身份信息(尤其在多智能体里,别人靠 `Description` 决定要不要把活派给你)。真正的核心只有一个:**`Run` 接收输入,返回一个事件流迭代器**。
+
+注意返回值不是 `(*Response, error)`,而是 `*AsyncIterator[*TypedAgentEvent[M]]`。这一个签名就把"Agent = 事件流生成器"钉死在了类型系统里。日常用的 `Agent` 只是它的一个别名(<SourceRef path="adk/interface.go:467" />):
+
+```go
+type Agent = TypedAgent[*schema.Message]
+```
+
+<Callout kind="key" title="本章的设计钥匙">
+把 Agent 的契约定义成"输入 → **事件流**"而不是"输入 → 答案",是 ADK 一切能力的地基。因为输出是**流**,才能实时地把中间过程(思考、调工具、转交)暴露出来;因为每个事件是**数据**,才能被观测、被序列化、被跨进程恢复。一个只返回最终答案的接口,永远做不到流式、中断续跑、多智能体协作——ADK 把这三样都"免费"地建在了这个最小契约之上。
+</Callout>
+
+## 事件:AgentEvent 里装了什么
+
+事件流里的每一颗珠子是 `TypedAgentEvent[M]`(<SourceRef path="adk/interface.go:419" />,别名 `AgentEvent` 在 <SourceRef path="adk/interface.go:438" />):
+
+```go
+type TypedAgentEvent[M MessageType] struct {
+    AgentName string              // 谁发出的
+    RunPath   []RunStep           // 从根到当前的执行路径(框架维护)
+    Output    *TypedAgentOutput[M] // 产出:消息或自定义输出
+    Action    *AgentAction        // 控制流动作(见下)
+    Err       error               // 出错时置位
+}
+```
+
+一个事件要么带 `Output`(产出了内容),要么带 `Action`(要改变控制流),要么带 `Err`。`RunPath` 记录"这个事件是在调用树的哪条路径上发生的",多智能体嵌套时靠它还原层级。
+
+## MessageVariant:一颗珠子,两种形态
+
+`Output` 里的消息用一个精巧的类型承载——`TypedMessageVariant[M]`(<SourceRef path="adk/interface.go:73" />)。它解决一个矛盾:**同一个事件,有时你想要"完整消息",有时你想要"边生成边看的流"**。
+
+```go
+type TypedMessageVariant[M MessageType] struct {
+    IsStreaming   bool                      // 判别器
+    Message       M                         // 物化消息(非流式时)
+    MessageStream *schema.StreamReader[M]   // 活流(流式时)
+    Role          schema.RoleType           // Assistant=模型输出,Tool=工具结果
+    ToolName      string                    // Role==Tool 时的工具名
+    // ...
+}
+```
+
+`IsStreaming` 是开关:为 `false` 时读 `Message`,为 `true` 时读 `MessageStream`。这就是为什么第 2 章里,同一套消费代码能同时应付流式和非流式——秘密全在这个判别式联合里。
+
+它还提供了 `GetMessage()`(<SourceRef path="adk/interface.go:100" />):流式时它会把流拼接成一条完整消息再返回,帮你抹平两种形态的差异。第 2 章用过的顶层 `GetMessage(event)` 助手(<SourceRef path="adk/utils.go:300" />)正是它的封装——而且会**复制一份流**,让你消费后事件里的流仍然可用。
+
+## Action:把控制流也变成数据
+
+最能体现"事件流"哲学的是 `AgentAction`(<SourceRef path="adk/interface.go:357" />)。它把"接下来该怎么走"也编码成了数据:
+
+```go
+type AgentAction struct {
+    Exit            bool                    // 结束运行
+    Interrupted     *InterruptInfo          // 中断(HITL)
+    TransferToAgent *TransferToAgentAction  // 转交给另一个 Agent
+    BreakLoop       *BreakLoopAction        // 跳出循环
+    CustomizedAction any
+    // ...
+}
+```
+
+回忆第 5 章:中断之所以能被序列化进 checkpoint,正因为它是 `Action.Interrupted` 这样一颗**数据珠子**,而不是一个 `error`。同理,`Exit`(由 `NewExitAction()` 构造,<SourceRef path="adk/interface.go:342" />)、`TransferToAgent`(<SourceRef path="adk/interface.go:333" />)都是数据。控制流一旦变成数据,就能被路由、被拦截、被记录、被恢复——这是后面所有机制的公共前提。
+
+<Callout kind="note" title="AsyncIterator:消费事件流的姿势">
+事件流的消费端是 `AsyncIterator[T]`(<SourceRef path="adk/utils.go:31" />),只有一个方法 `Next() (T, bool)`(<SourceRef path="adk/utils.go:35" />):第二个返回值为 `false` 表示流结束。生产端是配对的 `AsyncGenerator[T]`,Agent 内部往里 `Send` 事件,你在外面 `Next` 逐个取——一个标准的推-拉解耦。第 2 章你已经用过它,现在你知道它背后的类型了。
+</Callout>
+
+## 泛型 `[M]`:一套骨架,两种消息
+
+你可能注意到所有类型都带着 `[M MessageType]`。`MessageType` 是一个**封闭联合**(<SourceRef path="adk/interface.go:43" />):
+
+```go
+type MessageType interface {
+    *schema.Message | *schema.AgenticMessage
+}
+```
+
+它只允许两种消息类型,外部无法扩展。日常用的 `Agent`、`AgentEvent` 都是 `M = *schema.Message` 的别名;而当你要处理多模态的 agentic 消息时,同一套骨架换成 `M = *schema.AgenticMessage` 即可。这套泛型化是 v0.9 的核心动作——第 12 章会专门讲它为什么值得。这里你只需记住:**事件流的骨架只有一套,消息类型可以有两种**。
+
+## 本章小结
+
+- ADK 的世界观:**Agent 是事件流生成器**,不是问答对象。`Run` 返回 `*AsyncIterator[*TypedAgentEvent[M]]`。
+- `TypedAgent[M]` 只有三个方法(Name / Description / Run),`Agent` 是 `M=*schema.Message` 的别名。
+- `AgentEvent` 携带 `Output` / `Action` / `Err` 三选一,`RunPath` 记录调用路径。
+- `MessageVariant` 用 `IsStreaming` 判别式,让同一事件在"完整消息"与"活流"间统一;`GetMessage()` 抹平差异。
+- `AgentAction` 把 `Exit` / `Interrupted` / `TransferToAgent` / `BreakLoop` 都编码成**数据**——这是流式、中断续跑、多智能体的公共地基。
+- 泛型 `[M MessageType]` 是封闭联合,一套骨架支撑 `*schema.Message` 与 `*schema.AgenticMessage`。
+
+拿到"Agent = 事件流生成器"这把钥匙,下一章我们直捣全书高潮——当一个 Agent 要把活交给另一个 Agent,控制流该跳转(transfer)还是该被封装成工具(agent-as-tool)?这是两种世界观的正面交锋。

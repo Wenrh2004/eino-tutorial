@@ -1,0 +1,115 @@
+## 三个预置 Agent,三种组合范式
+
+第 7 章你已经跑通了 supervisor、DeepAgent、plan-execute。这一章换个高度:不问"怎么用",而问"它们各自代表哪一种**把 Agent 拼起来的范式**"。因为 ADK 的这三个预置件不是三个孤立的工具,而是三种组合哲学的**参考实现**——读懂它们,你就掌握了搭建任意多智能体系统的三块基本模板。
+
+三种范式可以先用一句话概括:
+
+| 预置件 | 组合范式 | 一句话 | 上下文 |
+| --- | --- | --- | --- |
+| Supervisor | **控制转移**(transfer) | 中心调度,接力交棒 | 共享 |
+| Plan-Execute | **工作流编排**(workflow) | 固定时序,规划→执行→重规划 | 结构化传递 |
+| DeepAgent | **智能体即工具**(agent-as-tool) | 嵌套调用,隔离执行 | 隔离 |
+
+<Mermaid title="三种组合范式的控制流对比" chart={`
+flowchart TB
+  subgraph S["Supervisor · 控制转移"]
+    SUP["主管"] -->|transfer| EA["专家 A"]
+    EA -->|交回| SUP
+    SUP -->|transfer| EB["专家 B"]
+    EB -->|交回| SUP
+  end
+  subgraph P["Plan-Execute · 工作流编排"]
+    PL["Planner"] --> LP["Loop"]
+    LP --> EX["Executor"] --> RP["Replanner"] --> LP
+  end
+  subgraph D["DeepAgent · 智能体即工具"]
+    MAIN["主 Agent"] -->|"task 工具调用"| SUB["子 Agent（隔离上下文）"]
+    SUB -->|"返回结果"| MAIN
+  end
+`} />
+
+
+## 范式一:Supervisor —— 用"控制转移"组合
+
+`supervisor.New`(<SourceRef path="adk/prebuilt/supervisor/supervisor.go:101" />)代表最直觉、也最"拟人"的组合:一个主管居中,把活派给专家,专家干完**交回**主管。它的实现只做了一件核心事——给每个子 Agent 包一层强制"转移回主管"的逻辑:
+
+```go
+// supervisor.New 内部(简化)
+for _, subAgent := range conf.SubAgents {
+    subAgents = append(subAgents, adk.AgentWithDeterministicTransferTo(ctx,
+        &adk.DeterministicTransferConfig{
+            Agent:        subAgent,
+            ToAgentNames: []string{supervisorName}, // 干完必须回主管
+        }))
+}
+```
+
+它建立在**控制转移 + 完整上下文共享**之上:所有 Agent 泡在同一份 session 里,彼此的中间过程互相可见。这带来"拟人协作"的直觉,但也带来第 9 章讲过的代价——控制流难以隔离、中断难以干净恢复。
+
+<Callout kind="warning" title="它被官方标注 NOT RECOMMENDED,但依然值得读">
+`supervisor.New` 的文档(<SourceRef path="adk/prebuilt/supervisor/supervisor.go:98" />)明确写着 **NOT RECOMMENDED**:transfer + 共享上下文经验上并未更有效。但它作为"控制转移范式"的最小参考实现,教学价值极高——它让你亲眼看到"共享上下文"这条路走到底是什么样,从而真正理解为什么另外两条路更好。**范式本身不因不推荐而失去学习意义。**
+</Callout>
+
+## 范式二:Plan-Execute —— 用"工作流编排"组合
+
+`planexecute.New`(<SourceRef path="adk/prebuilt/planexecute/plan_execute.go:862" />)代表另一种完全不同的组合思路:不靠模型临场决定"下一个交给谁",而是用**固定的时序结构**把几个 Agent 编排起来。它的实现极其诚实地暴露了这一点——它本身几乎没有新逻辑,只是把编排原语拼起来:
+
+```go
+// plan_execute.go 的 New(简化)
+loop, _ := adk.NewLoopAgent(ctx, &adk.LoopAgentConfig{
+    SubAgents:     []adk.Agent{cfg.Executor, cfg.Replanner},
+    MaxIterations: maxIterations, // 默认 10
+})
+return adk.NewSequentialAgent(ctx, &adk.SequentialAgentConfig{
+    SubAgents: []adk.Agent{cfg.Planner, loop}, // 先规划,再进循环
+})
+```
+
+拆开看就是:`Sequential(Planner, Loop(Executor, Replanner))`。先跑一次 `Planner` 出计划,再进入"执行一步 → 重规划"的 `Loop`。`Replanner`(<SourceRef path="adk/prebuilt/planexecute/plan_execute.go:807" />)判断任务完成时,通过 `respond` 工具触发 `BreakLoopAction` 跳出循环。
+
+<Callout kind="key" title="本章的设计钥匙">
+Plan-Execute 揭示了一件深刻的事:**多智能体的"编排"和 compose 引擎的"编排"是同一套东西**。`NewSequentialAgent`(<SourceRef path="adk/workflow.go:686" />)、`NewLoopAgent`(<SourceRef path="adk/workflow.go:704" />)、`NewParallelAgent`(<SourceRef path="adk/workflow.go:695" />)这几个 workflow 原语,让"Agent 之间怎么走"变成了一张可声明的图——而不是散落在提示词里让模型自己猜。这就是 Eino 的一以贯之:**能用确定性结构表达的,就不交给模型即兴发挥**。控制转移把时序交给模型,工作流编排把时序交给代码——后者可测、可复现、可推理。
+</Callout>
+
+这也解释了为什么 plan-execute 适合"步骤多、需要中途纠偏"的任务:计划是显式的数据,执行是确定的循环,纠偏是循环里的一个固定环节。整条链路你都能静态看懂。
+
+## 范式三:DeepAgent —— 用"智能体即工具"组合
+
+`deep.New`(<SourceRef path="adk/prebuilt/deep/deep.go:171" />)代表第 9 章推崇的组合方式,也是三者里工程上最推荐的。它的精髓在实现里看得最清楚:所有子 Agent 不是被平铺,而是被一个 **task tool 中间件**收敛成**单个 `task` 工具**(<SourceRef path="adk/prebuilt/deep/deep.go:131" />)。
+
+```go
+// NewTyped 内部(简化):把子 Agent 装进一个 task 工具中间件
+if !cfg.WithoutGeneralSubAgent || len(cfg.SubAgents) > 0 {
+    tt, _ := typedTaskToolMiddleware(ctx, ..., cfg.SubAgents, ...)
+    handlers = append(handlers, tt) // 子 Agent → 一个中间件 → 一个 task 工具
+}
+return adk.NewTypedChatModelAgent(ctx, &adk.TypedChatModelAgentConfig[M]{
+    ...
+    Handlers: append(handlers, cfg.Handlers...),
+})
+```
+
+注意这里的巧妙:DeepAgent **本身就是一个普通 `ChatModelAgent`**,只是通过第 10 章讲的中间件机制,把"调度子 Agent"的能力当作一个工具叠了上去。子 Agent 在隔离上下文里执行,主 Agent 只拿到 `task` 的返回值。三种能力——可组合、可控、中断可传播——由此而来(实现细节留到第 16 章)。
+
+这个设计的优雅之处在于**范式的自洽**:它没有引入"多智能体"这个新概念,而是把多智能体**还原**成了"Agent + 工具 + 中间件"这套已有的原语。少一个概念,就少一处特例。
+
+## 三种范式如何选
+
+把三者放在一起,选择标准就清晰了:
+
+- **时序由谁定?** 模型临场决定 → transfer(supervisor);代码固定 → workflow(plan-execute);主 Agent 按需调用 → agent-as-tool(DeepAgent)。
+- **上下文要不要隔离?** 要隔离、要可组合、要中断可传播 → DeepAgent(默认首选)。
+- **任务是否有清晰的多步骤结构?** 有,且需要中途纠偏 → plan-execute。
+- **什么时候用 supervisor?** 几乎不建议在生产用;但当你想教学式地理解"共享上下文范式"时,它是最好的活标本。
+
+三个预置件,本质是 Eino 递给你的三张模板。真实系统里你常常会**混用**:一个 DeepAgent 的某个子 Agent,内部可以是一个 plan-execute;一个 workflow 的某个节点,可以挂一个 agent-as-tool。范式是可以嵌套组合的——这正是"组合优于跳转"哲学的红利。
+
+## 本章小结
+
+- 三个预置 Agent 是三种组合范式的参考实现:supervisor=**控制转移**、plan-execute=**工作流编排**、DeepAgent=**智能体即工具**。
+- Supervisor(<SourceRef path="adk/prebuilt/supervisor/supervisor.go:101" />)靠强制"转移回主管"实现中心辐射,共享上下文——NOT RECOMMENDED,但是理解 transfer 范式的活标本。
+- Plan-Execute(<SourceRef path="adk/prebuilt/planexecute/plan_execute.go:862" />)= `Sequential(Planner, Loop(Executor, Replanner))`,揭示"多智能体编排 = compose 工作流编排"。
+- DeepAgent(<SourceRef path="adk/prebuilt/deep/deep.go:171" />)把子 Agent 收敛成单个 `task` 工具,把多智能体**还原**为"Agent+工具+中间件",范式自洽。
+- 选择标准:时序由谁定、要不要隔离、有无多步结构;三者可嵌套混用。
+
+设计部分只剩最后一块拼图:v0.9 为什么要把整套 ADK **泛型化**?下一章讲 `AgenticMessage` 与 `[M MessageType]` 如何让 chat 与 agentic 复用同一体系。

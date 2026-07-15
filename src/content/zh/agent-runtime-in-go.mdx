@@ -1,0 +1,201 @@
+## 收尾:这台 Agent Runtime,为什么是"Go 的"
+
+走到这里,你已经把 Eino 从最外层的 ADK 一路拆到最底层的 compose 引擎。最后一章,我们不再引入新机制,而是退后一步,问一个贯穿全书的问题:
+
+**为什么 Eino 是用 Go 写的,而不是"恰好用 Go 写"?**
+
+很多框架换种语言重写,骨架不变。但 Eino 不是——它的并行调度、取消传播、类型安全、持久化,几乎每一处关键设计,都**直接长在 Go 的原生机制上**:goroutine + channel、`context.Context`、泛型、接口、`encoding/gob`。这一章把这五根"语言支柱"逐一点出来,让你看清:Eino 不是"用 Go 实现的 Agent 框架",而是"一台以 Go 并发模型为地基的 Agent Runtime"。
+
+<Mermaid title="Agent Runtime 的五根 Go 原生支柱" chart={`
+flowchart TB
+  subgraph RT["Eino Agent Runtime"]
+    SCHED["并行调度<br/>每并行节点一 goroutine<br/>compose/graph_manager.go"]
+    CANCEL["取消传播<br/>context.Context 贯穿<br/>adk/turn_loop.go"]
+    TYPE["类型安全<br/>泛型 TypedAgent[M] / BaseModel[M]<br/>adk · components/model"]
+    SEAM["组合接缝<br/>接口 Runnable / Agent<br/>compose/runnable.go"]
+    PERSIST["原生持久化<br/>encoding/gob<br/>schema/serialization.go"]
+  end
+  GO1["goroutine + UnboundedChan"] --> SCHED
+  GO2["context.Context"] --> CANCEL
+  GO3["Go 泛型"] --> TYPE
+  GO4["interface"] --> SEAM
+  GO5["encoding/gob"] --> PERSIST
+`} />
+
+## 支柱一:并行 = 每个节点一个 goroutine
+
+第 22 章你看过扇出扇入的"数据面";这里看它的"调度面"。当同一轮里有多个节点要跑,`taskManager.submit`(<SourceRef path="compose/graph_manager.go:300" />)的做法朴素到令人安心——**给每个并行任务起一个 goroutine**:
+
+```go
+func (t *taskManager) submit(tasks []*task) error {
+    // ...pre-handler
+    var syncTask *task
+    if t.num == 0 && (len(tasks) == 1 || t.needAll) && t.cancelCh == nil {
+        syncTask = tasks[0]        // 优化:只有一个任务且不可被中断时,当前 goroutine 直接跑
+        tasks = tasks[1:]
+    }
+    for _, currentTask := range tasks {
+        t.num += 1
+        go t.execute(currentTask)  // ← 其余每个任务,起一个 goroutine
+    }
+    if syncTask != nil {
+        t.num += 1
+        t.execute(syncTask)        // 同步任务在本 goroutine 跑,省一次调度
+    }
+    return nil
+}
+```
+
+没有线程池、没有 worker 队列、没有复杂的调度器——因为 Go 的 goroutine 本身就是"廉价的并发单元",runtime 已经替你把 M:N 调度做好了。框架只需说一句 `go`,剩下的交给语言。这就是"用语言原生机制"的第一层含义:**能用 goroutine 表达的并发,就不要自己造调度器**。
+
+那 goroutine 跑完的结果怎么收? `execute` 在 `defer` 里把任务(连同 panic 恢复)送进一个 `done` 通道(<SourceRef path="compose/graph_manager.go:285" />),而这个通道是自研的 `UnboundedChan`(<SourceRef path="internal/channel.go:22" />):
+
+```go
+type UnboundedChan[T any] struct {
+    buffer   []T
+    mutex    sync.Mutex
+    notEmpty *sync.Cond   // 用条件变量而非固定容量 channel
+    closed   bool
+}
+```
+
+为什么不用原生 `chan`?因为原生 channel 有固定容量:满了就阻塞发送方。而每轮并行任务数不定,若用有界 channel,快跑完的 goroutine 可能被慢消费方堵住,甚至死锁。`UnboundedChan` 用 `sync.Cond` + 切片做了一个**无界缓冲**:`Send` 永不阻塞,`Receive` 在空时用条件变量挂起。**这是对 Go 原生机制的一次"补齐"——语言给了 channel 和 Cond 两块积木,框架拼出了它需要的那一种。**
+
+<Callout kind="note" title="goroutine 廉价,但不是免费">
+"每节点一 goroutine"之所以可行,是因为 goroutine 初始栈仅 2KB、由 runtime 复用系统线程。但这不代表可以无限起——若一个图里有成千上万个并行节点,仍会有调度与内存压力。Eino 的取舍是把并发粒度定在"图节点"这一层(而非更细的每个 chunk),既拿到了并行收益,又让 goroutine 数量与图规模同阶、可控。
+</Callout>
+
+## 支柱二:取消 = context.Context 一贯到底
+
+第 17 章你见过 `TurnLoop.run` 里监听取消的那个 goroutine。现在把它放到"语言支柱"的高度重看(<SourceRef path="adk/turn_loop.go:1570" />):
+
+```go
+func (l *TurnLoop[T, M]) run(ctx context.Context) {
+    // ...
+    go func() {
+        select {
+        case <-ctx.Done():      // ← 外部取消,来自 context.Context
+            l.buffer.Close()    // 翻译成:关闭内部 buffer
+        case <-l.done:
+        }
+    }()
+    // ...
+}
+```
+
+取消信号不是 Eino 自己发明的一套广播机制,而是**直接搭在 `context.Context` 上**。这带来三个免费的好处:
+
+1. **自动向下传播**:父 `ctx` 取消,所有派生 `ctx` 一起取消——多智能体嵌套时,取消根 agent 会级联到 AgentTool 里的子 agent(第 16 章讲过 Interrupted 穿透、而 Exit/Transfer 被吞的区别)。
+2. **与超时/deadline 统一**:`context.WithTimeout` 和手动取消走同一套 `Done()` 通道,框架不必区分"是超时还是用户取消"。
+3. **随取消清理**:`runContext`(第 17 章)挂在 `ctx` 上,取消时一并回收,没有悬挂状态。
+
+而"精确到安全点"的取消(第 17 章的 `CancelMode` 位掩码)则是在这条 `ctx` 主干上叠的一层更细的控制。**底座是语言的 `context.Context`,框架只在其上加了"在哪停"的粒度**——这又是"不重造轮子"的体现。
+
+## 支柱三:类型安全 = 泛型承载,编译期兜底
+
+Eino 最显眼的现代化改造,是全面泛型化。你在第 8、12 章见过的 `TypedAgent[M]`(<SourceRef path="adk/interface.go:453" />),用一个类型参数 `M` 同时表达"我处理普通消息"还是"我处理 agentic 消息":
+
+```go
+type TypedAgent[M MessageType] interface {
+    Name(ctx context.Context) string
+    Description(ctx context.Context) string
+    Run(ctx context.Context, input *TypedAgentInput[M], options ...AgentRunOption) *AsyncIterator[*TypedAgentEvent[M]]
+}
+type Agent = TypedAgent[*schema.Message]   // 老代码用的别名,零迁移成本
+```
+
+同样的手法贯穿到底层模型层 `BaseModel[M]`(<SourceRef path="components/model/interface.go:36" />):
+
+```go
+type BaseModel[M messageType] interface {
+    Generate(ctx context.Context, input []M, opts ...Option) (M, error)
+    Stream(ctx context.Context, input []M, opts ...Option) (*schema.StreamReader[M], error)
+}
+type BaseChatModel = BaseModel[*schema.Message]  // 同样保留别名
+```
+
+泛型在这里干了两件互不冲突的事:**对内**,`chat` 与 `agentic` 两套消息体系复用同一批接口和编排代码,不必复制一份;**对外**,通过 `type Agent = TypedAgent[*schema.Message]` 这样的别名,老用户的代码一行不改。这就是"泛型承载类型安全"的价值——它把"多消息类型"这个变化点收敛成一个类型参数,而不是散落成一堆 `interface{}` + 运行时断言。第 20 章你还看过 compose 层用 `reflect.Type` 在编译期做连线校验,那是同一种"把错误提前到编译期"哲学在编排层的延伸。
+
+## 支柱四:组合 = 接口作为接缝
+
+如果说泛型管"类型正确",那接口管"能不能拼在一起"。整个 Eino 的可组合性,建立在几个关键接口作为"接缝(seam)"之上。最核心的是 `Runnable`(<SourceRef path="compose/runnable.go:32" />):
+
+```go
+type Runnable[I, O any] interface {
+    Invoke(ctx context.Context, input I, opts ...Option) (output O, err error)
+    Stream(ctx context.Context, input I, opts ...Option) (output *schema.StreamReader[O], err error)
+    Collect(ctx context.Context, input *schema.StreamReader[I], opts ...Option) (output O, err error)
+    Transform(ctx context.Context, input *schema.StreamReader[I], opts ...Option) (output *schema.StreamReader[O], err error)
+}
+```
+
+第 18 章讲过,任何组件只要实现其中一个方法,框架就能自动补齐其余三个范式。这正是 Go 接口"隐式实现 + 小接口"哲学的红利:`Graph`、`Chain` 编译后都变成 `Runnable`,于是"一张图"可以像"一个组件"一样被塞进另一张图——组合是无限递归的,因为接缝是统一的。同理,`Agent`(<SourceRef path="adk/interface.go:453" />)这个接口让 supervisor、DeepAgent、你自己写的 agent 彼此可替换;而第 16 章的 AgentTool 之所以能"把一个 agent 当工具用",本质就是让 agent 去实现 `tool.BaseTool` 这条接缝。**接口不是用来做面向对象继承的,而是用来定义"可替换点"的**——这是 Eino 组合哲学最 Go 的地方。
+
+## 支柱五:持久化 = 站在 encoding/gob 肩上
+
+最后一根支柱,是把"跑到一半的状态"存下来的能力(第 5、23 章的 checkpoint/resume 全靠它)。Eino 没有自造序列化协议,而是包在标准库 `encoding/gob` 外面一层 `RegisterName`(<SourceRef path="schema/serialization.go:83" />):
+
+```go
+func RegisterName[T any](name string) {
+    gob.RegisterName(name, generic.NewInstance[T]())   // ← 复用标准库 gob
+    err := serialization.GenericRegister[T](name)      // 再登记进自己的泛型注册表
+    if err != nil {
+        panic(err)
+    }
+}
+```
+
+为什么选 gob 而不是 JSON?因为 checkpoint 要存的是**图的中间状态**——可能含接口类型、具体实现、私有语义。gob 天生支持"注册具体类型 → 按名字还原接口",这正是"接口作接缝"的运行时代价:存的时候是接口,读回来必须知道当初塞的是哪个具体类型。`RegisterName` 一边喂给 `gob.RegisterName`,一边登记进 Eino 自己的泛型注册表,让泛型类型也能被稳定地按名字还原。
+
+要说清楚的是:**这里真正暴露的是 Go 的一处局限,而不是 gob 有多好。** gob 只在 Go 生态内可读(跨语言无解)、是不透明的二进制(难以人工审计)、且对类型演进敏感(字段增减、类型改名都可能让旧 checkpoint 读不回来)。之所以还是选它,是因为需求是"序列化一个可能含接口、含私有字段的图状态"——而今天的 Go 并没有一个既原生、又能优雅处理接口多态的序列化方案,gob 只是"离标准库最近、改动最小"的那一个。
+
+而这并不是 Eino 里 Go 局限性暴露的唯一一处:并行那节里,原生 channel 容量固定、无法无界增长,才逼出了自研的 `UnboundedChan`;类型安全那节里,泛型表达力不足以覆盖"运行时按名字还原类型",才需要在 gob 之外再补一张泛型注册表。这些都不是设计缺陷,而是**一个诚实的框架在语言边界处留下的接缝痕迹**——持久化能力不是从零造的,而是把 gob 这块现成积木包成勉强够用的形状;如果哪天 Go 有了更好的原生序列化,这块最该被替换。
+
+## 技术选型的取舍:Go 的局限,在别的语言里往往是白给的
+
+前面五节讲的都是"Eino 在 Go 里怎么做"。但技术选型从来不是"哪门语言更好",而是"你愿意为什么付代价"。把 Eino 的需求放到 Node.js 和 Python 面前(当下最主流的两个 Agent 框架栈——LangChain/LangGraph 的 JS 与 Python 版恰好长在这两门语言上),会发现一个反直觉的事实:**Eino 在 Go 里辛苦手搓的好几块,换到动态语言里几乎是一行白给的。**
+
+先看 Go 吃亏、别人白给的三处——这几处正是前面章节里 Eino 不得不"补一块"的地方:
+
+| Eino 在 Go 里被迫手搓的能力 | Go 的做法(有成本) | Python / Node 怎么白给 |
+|---|---|---|
+| **序列化含接口/私有字段的图状态** | `encoding/gob` + `RegisterName` 手工注册每个具体类型,否则接口读不回来(<SourceRef path="schema/serialization.go:83" />) | Python `pickle.dumps(obj)` 一行存任意对象(含私有字段、嵌套类);Node 有 `structuredClone` 与海量序列化库 |
+| **无界的任务结果缓冲** | 原生 `chan` 容量固定,得用 `sync.Cond` + 切片自研 `UnboundedChan`(<SourceRef path="internal/channel.go:22" />) | Python `asyncio.Queue()`、Node 数组/EventEmitter 默认就是无界的,压根不存在"满了阻塞"这个问题 |
+| **运行时按名字还原类型** | 泛型擦不掉、又拿不到运行时类型,只能另建一张泛型注册表兜底 | Python 有 `importlib` + `getattr` 动态取类、`eval`;JS 有动态 `import()` 与原型链改写,运行时造类型是家常便饭 |
+
+这三行的共同点是:**Go 是静态编译语言,拒绝了"运行时凭空造类型/存任意对象"这条捷径**,于是 Eino 只能用注册表、条件变量这些"笨办法"把它补回来。动态语言天生就有这套能力,自然一行白给。如果你的 Agent 主要是"胶水三方 API、快速试错、状态随存随取",Python/Node 的省心是实打实的——这也是它们生态更繁荣的原因之一。
+
+那 Eino 为什么还是选了 Go?因为把镜头转到另外三处,天平会猛地倒过来——**这几处恰恰是 Agent Runtime 最吃紧的地方,而动态语言要么做得很别扭,要么根本做不到:**
+
+| Agent Runtime 最吃紧的能力 | Go 白给 | Python / Node 要费劲甚至做不到 |
+|---|---|---|
+| **真并行调度** | goroutine 是廉价并发单元,`go f()` 即真并行,runtime 自动 M:N 铺满多核 | Python 有 GIL,多线程跑不满多核,真并行要 `multiprocessing`(进程重、跨进程要序列化);Node 单线程事件循环,CPU 密集要绕 Worker Threads |
+| **统一可取消** | `context.Context` 是全语言约定,一路穿透、与超时合流、级联取消,几乎零成本 | Node 的 `AbortSignal` 较新、未被所有库统一采纳,常要手工接线;Python 线程无法被安全打断,取消语义随执行模型分裂 |
+| **带到运行时的类型安全** | 泛型 + 编译期检查,连线错误 `go build` 就报,且类型信息不被擦除 | TS 类型运行时被擦除、Python 注解不强制,错误往往推迟到线上才炸 |
+
+于是取舍就清晰了:**选 Go,等于主动放弃"运行时动态造类型/存任意对象"的便利(so 才要手搓 gob 注册表、UnboundedChan),换来"真多核并行 + 统一取消 + 编译期强类型"这一组动态语言给不了的地基。** 对一个"高并发、可取消、需要长期演进"的服务端 Agent Runtime 来说,前者的代价(多写几百行注册/缓冲代码)是一次性的、可控的;而后者(GIL、擦除的类型、割裂的取消)一旦选错,是渗透进每一个并发路径、每一次线上排障的持续税。Eino 押的就是这个方向。
+
+<Callout kind="key" title="选型的本质:一次性的代价 vs 持续的税">
+Go 的局限(手搓序列化、手搓无界缓冲、手建类型注册表)都是**一次性写完就沉底的代价**;动态语言的便利背后,是**每次并发、每次取消、每次线上类型错误都要还的持续税**。Eino 选 Go,不是因为 Go 处处都强,而是因为在 Agent Runtime 这个特定问题上,它愿意付前者、拒付后者。技术选型没有银弹,只有"你愿意为哪种痛苦买单"。
+</Callout>
+
+
+<Callout kind="key" title="全书的设计钥匙">
+Eino 的每一台引擎,都刻意选择"长在 Go 的原生机制上",而不是在语言之上另造一套:并行用 goroutine(只在 channel 不够用时补一个 UnboundedChan)、取消用 context.Context(只叠一层安全点粒度)、类型安全用泛型(把多消息类型收敛成类型参数)、组合用接口(把它当"可替换点"而非继承)、持久化用 gob(用泛型注册表包一层——这一块更是 Go 局限性暴露得最明显的地方)。**这就是"Go 原生 Agent Runtime"的真正含义:框架的复杂度,尽可能地借用语言已经解决的部分,只在语言的缝隙处补最小的一块。** 读懂这一点,你就读懂了 Eino 为什么长成现在这个样子——它不是"移植到 Go",而是"从 Go 长出来"。
+</Callout>
+
+<Callout kind="tip" title="动手 · 收尾练习">
+回顾你在 Part I 写的第一个 Agent,现在给它的每一次运行,在心里标注这五根支柱各在哪一刻起作用:`runner.Run` 背后哪几个 goroutine 起来了?取消若发生,信号从哪个 `ctx.Done()` 进来、传到哪几层?你用的 `Agent`/`ChatModel` 分别是哪个泛型实例?如果要给这次运行加 checkpoint,你需要 `RegisterName` 哪些自定义类型?能把这五个问题都答上来,你就不只是"会用 Eino",而是真正理解了这台 Agent Runtime 的地基。
+</Callout>
+
+## 本章小结
+
+- Eino 不是"用 Go 实现的框架",而是"长在 Go 原生机制上的 Agent Runtime"——五根支柱各对应一块语言能力。
+- **并行调度**:`taskManager.submit`(<SourceRef path="compose/graph_manager.go:300" />)给每个并行节点起一个 goroutine,结果经自研无界通道 `UnboundedChan`(<SourceRef path="internal/channel.go:22" />)回收——只在原生 channel 不够用处补一块。
+- **取消传播**:`TurnLoop.run`(<SourceRef path="adk/turn_loop.go:1570" />)把取消直接搭在 `context.Context` 上,免费获得向下传播、超时统一、随取消清理。
+- **类型安全**:泛型 `TypedAgent[M]`(<SourceRef path="adk/interface.go:453" />)与 `BaseModel[M]`(<SourceRef path="components/model/interface.go:36" />)把"多消息类型"收敛成一个类型参数,并用别名保住零迁移。
+- **组合接缝**:`Runnable`(<SourceRef path="compose/runnable.go:32" />)等接口把"可替换点"标准化,让图能像组件一样递归组合。
+- **原生持久化**:`RegisterName`(<SourceRef path="schema/serialization.go:83" />)在 `encoding/gob` 外包一层泛型注册表,支撑 checkpoint/resume——这里也最能看出 Go 的局限(仅 Go 内可读、二进制不透明、对类型演进敏感),和 `UnboundedChan`、泛型注册表一样,都是语言边界处的接缝。
+- 设计钥匙:**借用语言已经解决的部分,只在缝隙处补最小的一块**——这就是"Go 原生 Agent Runtime"。
+
+全书到此结束。你从"会用 ADK"出发,穿过"理解设计意图"与"看清实现",最后落到"看懂它为什么是 Go 的"。愿你带走的不只是 Eino 的用法,而是这套"用组合代替分支、用语言原生机制承载复杂度"的设计品味——它在你写任何系统时都用得上。

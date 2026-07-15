@@ -1,0 +1,115 @@
+## 一个 Agent,如何装成一把工具
+
+第 7 章你亲手跑通了两条多智能体路线:transfer(交接控制权 + 共享上下文)和 agent-as-tool(调用 + 隔离上下文)。第 8、9 章我们辩论了为什么后者更值得推崇。现在,Part III 的收尾,我们要看它的**实现**——AgentTool 到底用什么魔法,让一个完整的 Agent 伪装成一把普通工具,同时把控制流牢牢隔离?
+
+<Viz name="agent-tool-vs-transfer" />
+
+再看一眼这张图的右半边:主 Agent 调用子 Agent,子 Agent 在隔离的上下文里跑完,**只把结果交回来**。本章就是要把"只把结果交回来"这句话,拆成源码里的一行行判断。
+
+## 适配器:把 Agent 塞进 tool.BaseTool
+
+入口是你熟悉的 `NewAgentTool`(<SourceRef path="adk/agent_tool.go:93" />)和泛型版 `NewTypedAgentTool`(<SourceRef path="adk/agent_tool.go:107" />)。它们返回的是一个 `tool.BaseTool`——注意,对主 Agent 来说,它拿到的就是一把再普通不过的工具,和第 3 章那些函数工具没有任何区别。
+
+魔法藏在内部类型 `typedAgentTool[M]`(<SourceRef path="adk/agent_tool.go:120" />)里:
+
+```go
+type typedAgentTool[M MessageType] struct {
+    agent                  TypedAgent[M]        // 被包裹的真 Agent
+    fullChatHistoryAsInput bool
+    inputSchema            *schema.ParamsOneOf
+}
+
+type agentTool = typedAgentTool[*schema.Message]
+```
+
+它是一个**适配器(adapter)**:对内持有一个完整的 Agent,对外只实现工具接口的两个方法——`Info`(<SourceRef path="adk/agent_tool.go:133" />)返回工具描述,`InvokableRun`(<SourceRef path="adk/agent_tool.go:154" />)执行工具。
+
+<Callout kind="note" title="为什么只实现 InvokableRun,没有 StreamableRun">
+AgentTool 是一把 `InvokableTool`,不是 `StreamableTool`。这不是偷懒,而是语义使然:工具的契约是"一次调用 → 一个结果"。哪怕内部 Agent 跑了十轮 ReAct、产生了满地事件,对外它也必须收敛成**一个返回值**。这个"收敛"正是隔离的第一层含义——子 Agent 的过程,主 Agent 看不到,只看到终值。
+</Callout>
+
+## 隔离的实现:一个私有的运行环境
+
+`InvokableRun`(<SourceRef path="adk/agent_tool.go:154" />)一进来,做的第一件事就是搭一个**与外界隔离的运行环境**。这是本章的核心,分三步。
+
+**第一步,建一个私有的 bridgeStore。** 每次全新调用都 `newBridgeStore()`(<SourceRef path="adk/agent_tool.go:166" />)——上一章讲过,这是那个用固定 key 桥接 checkpoint 的内存 store。给子 Agent 配一个**专属**的桥,意味着子 Agent 的中断状态存在自己的空间里,不会污染主 Agent 的 checkpoint。
+
+**第二步,起一个专属的内层 Runner。** `newTypedInvokableAgentToolRunner`(<SourceRef path="adk/agent_tool.go:196" />,实现在 :411)用刚才那个私有 bridgeStore 构造一个只服务于这次工具调用的 Runner,然后跑起来:
+
+```go
+runner := newTypedInvokableAgentToolRunner(at.agent, ms, enableStreaming)
+iter = runner.Run(ctx, input,
+    append(extractAndDeriveAgentToolCancelCtx(...),
+        WithCheckPointID(bridgeCheckpointID),
+        withSharedParentSession())...)
+```
+
+**第三步,只共享 session 的 Values,不共享控制流。** 注意那个 `withSharedParentSession()`(<SourceRef path="adk/call_option.go:69" />)——它看起来像在"共享上下文",但看清楚它到底共享了什么。实现在 `ctxWithNewTypedRunCtx`(<SourceRef path="adk/runctx.go:537" />):
+
+```go
+if sharedParentSession {
+    if parentSession := getSession(ctx); parentSession != nil {
+        session = &runSession{
+            Values:    parentSession.Values,    // 只借用键值对(和它的锁)
+            valuesMtx: parentSession.valuesMtx,
+        }
+    }
+}
+```
+
+它**只**把父 session 的 `Values`(那份键值存储)借给子 Agent,而**事件列表、RunPath、控制流状态全是新建的**。这就是"隔离上下文"的精确定义:子 Agent 能读到主 Agent 放进 session 的共享数据(比如用户偏好),但它满地的中间事件、它的控制流决策,统统关在自己的运行环境里,出不去。
+
+<Callout kind="key" title="本章的设计钥匙">
+AgentTool 的隔离,不是"什么都不共享",而是一次**精确的边界切割**:**数据平面共享,控制平面隔离**。子 Agent 能读到共享的 session Values(数据),但它的 Exit、TransferToAgent、BreakLoop 这些**控制动作**,一律出不了工具边界。对照第 7 章的 transfer——那里控制权真的流走了、上下文真的整份共享;而这里,主 Agent 稳坐钓鱼台,只把子 Agent 当一个"给个输入、还个结果"的黑盒。可组合性,正来自这条清晰的边界。
+</Callout>
+
+## 吞与穿:一个决定成败的判断
+
+现在到了最精彩的地方。子 Agent 跑起来后会吐出一串事件,`InvokableRun` 用一个循环消费它们。关键在这个**转发闸门**(<SourceRef path="adk/agent_tool.go:235" />):
+
+```go
+if gen != nil {
+    if event.Action == nil || event.Action.Interrupted == nil {
+        // ...拼接 RunPath 用于可观测
+        tmp := copyTypedAgentEvent(event)
+        gen.Send(event)   // 转发给最终用户观看(仅用于展示)
+        event = tmp
+    }
+}
+```
+
+注意这个闸门只做一件事:把事件转发给**最终用户**看(为了可观测),而**从不据此改变主 Agent 的行为**。这就产生了两种截然不同的命运:
+
+**Exit / TransferToAgent / BreakLoop —— 被"吞掉"。** 这三种控制动作会随事件流过,也会被转发给用户观看,但主 Agent **从不读取、从不执行**它们。为什么?因为 `InvokableRun` 最终只返回**一个字符串**(工具结果):循环结束后,它取子 Agent 最后一条消息的文本作为返回值(<SourceRef path="adk/agent_tool.go:268" />)。子 Agent 想 Exit?它只是结束了自己的运行,主 Agent 该干嘛干嘛。子 Agent 想 Transfer 给别人?那是它内部的事,主 Agent 收到的还是一个字符串。**控制动作因"无人读取"而降级成了普通的最终文本。**
+
+**Interrupted —— 被"穿透"。** 只有中断是例外。看那个闸门的条件:`event.Action.Interrupted != nil` 时,事件**不会**被普通转发;循环结束后有一段专门处理(<SourceRef path="adk/agent_tool.go:251" />):
+
+```go
+if lastEvent != nil && lastEvent.Action != nil && lastEvent.Action.Interrupted != nil {
+    data, existed, err_ := ms.Get(ctx, bridgeCheckpointID)  // 从私有桥取回中断状态
+    // ...
+    return "", tool.CompositeInterrupt(ctx, "agent tool interrupt", data,
+        lastEvent.Action.internalInterrupted)               // 重新抛出,穿透工具边界
+}
+```
+
+它从私有 bridgeStore 取回子 Agent 的中断字节,再用上一章讲的 `tool.CompositeInterrupt`(<SourceRef path="adk/interrupt.go:156" />)把这个中断**重新抛给工具的调用方**。于是子 Agent 深处的一个"等人审批"的中断,能穿过工具边界、穿过主 Agent,一路冒到最顶层的 Runner——正如第 7 章那句伏笔:"中断可传播"。
+
+<Callout kind="warning" title="为什么偏偏中断要穿透,别的要吞掉?">
+Exit/Transfer/BreakLoop 是**局部控制流**——它们只应影响子 Agent 自己的执行,若能穿透边界,子 Agent 就能"劫持"主 Agent 的控制权,可组合性荡然无存。而中断是**全局协作事件**:一个需要人介入的暂停,无论发生在多深的嵌套里,都必须让最顶层知道、并能续跑。源码在 `AgentAction` 的注释里把这条规则写得清清楚楚(<SourceRef path="adk/interface.go:346" />):"Interrupted 通过 CompositeInterrupt 传播;Exit、TransferToAgent、BreakLoop 在 agent tool 之外被忽略"。`NewAgentTool` 的文档(<SourceRef path="adk/agent_tool.go:80" />)重复了同样的契约。
+</Callout>
+
+## 取消也顺着边界走
+
+隔离不止于数据和中断,取消也一样。工具一进来就 `markAgentToolDescendant()`(<SourceRef path="adk/agent_tool.go:166" /> 附近),给自己打上"我是 AgentTool 的后代"的标记;`extractAndDeriveAgentToolCancelCtx`(<SourceRef path="adk/agent_tool.go:325" />)则为子 Agent 派生出一个独立的取消上下文。默认情况下,主 Agent 的取消只作用于自己,子 Agent 靠 `context` 取消被顺带拆掉(见上一章 `CancelMode` 注释 <SourceRef path="adk/cancel.go:43" />);只有显式开启 `WithRecursive`,取消才会递归下探到 AgentTool 内部。这又是同一条设计线:**边界默认隔离,穿透需要显式声明**。
+
+## 本章小结
+
+- AgentTool 是一个**适配器**(<SourceRef path="adk/agent_tool.go:120" />):对内持有完整 Agent,对外只实现 `Info` + `InvokableRun`(<SourceRef path="adk/agent_tool.go:154" />),是 `InvokableTool` 而非 Streamable——"一次调用一个结果"是它隔离的第一层含义。
+- 隔离靠**私有运行环境**:每次调用新建 `bridgeStore`(<SourceRef path="adk/agent_tool.go:166" />)、专属内层 Runner(<SourceRef path="adk/agent_tool.go:196" />)、`withSharedParentSession` 只借 session 的 `Values`(<SourceRef path="adk/runctx.go:537" />)。
+- 设计钥匙:**数据平面共享,控制平面隔离**。
+- 转发闸门(<SourceRef path="adk/agent_tool.go:235" />)决定命运:**Exit/Transfer/BreakLoop 因无人读取而被吞掉**(降级成最终文本 <SourceRef path="adk/agent_tool.go:268" />),**Interrupted 被 `CompositeInterrupt` 穿透**工具边界(<SourceRef path="adk/agent_tool.go:251" />)。
+- 契约写在源码注释里(<SourceRef path="adk/interface.go:346" />):局部控制流被隔离,全局协作事件(中断)被传播。
+- 取消同理:默认不下探,`WithRecursive` 才递归——边界默认隔离,穿透需显式。
+
+Part III 到此结束。你已经把 ADK 从"骨架(Runner/flowAgent)"到"引擎(ReAct 图)"到"长跑(TurnLoop)"再到"组合(AgentTool)"完整拆了一遍。下一部分,我们下沉到更底层:支撑这一切的 compose 编排引擎——ADK 的中断、流式、类型安全,全都源自那里。

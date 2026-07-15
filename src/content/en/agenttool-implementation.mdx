@@ -1,0 +1,115 @@
+## How an agent masquerades as a tool
+
+In Chapter 7 you got both multi-agent routes running by hand: transfer (hand off control + share context) and agent-as-tool (call + isolate context). Chapters 8 and 9 debated why the latter deserves the favor. Now, to close Part III, we look at its **implementation** — what magic does the AgentTool use to make a full agent masquerade as an ordinary tool while keeping control flow firmly isolated?
+
+<Viz name="agent-tool-vs-transfer" />
+
+Glance at the right half of the diagram again: the main agent calls a sub-agent, the sub-agent runs to completion in an isolated context, and **only its result comes back**. This chapter unpacks that phrase — "only its result comes back" — into the concrete lines of judgment in the source.
+
+## The adapter: fitting an agent into tool.BaseTool
+
+The entry points are the familiar `NewAgentTool` (<SourceRef path="adk/agent_tool.go:93" />) and its generic `NewTypedAgentTool` (<SourceRef path="adk/agent_tool.go:107" />). They return a `tool.BaseTool` — note that to the main agent, what it gets is a perfectly ordinary tool, no different from the function tools of Chapter 3.
+
+The magic hides in the internal type `typedAgentTool[M]` (<SourceRef path="adk/agent_tool.go:120" />):
+
+```go
+type typedAgentTool[M MessageType] struct {
+    agent                  TypedAgent[M]        // the wrapped, real agent
+    fullChatHistoryAsInput bool
+    inputSchema            *schema.ParamsOneOf
+}
+
+type agentTool = typedAgentTool[*schema.Message]
+```
+
+It's an **adapter**: internally it holds a full agent, externally it implements only two methods of the tool interface — `Info` (<SourceRef path="adk/agent_tool.go:133" />) returns the tool description, and `InvokableRun` (<SourceRef path="adk/agent_tool.go:154" />) executes the tool.
+
+<Callout kind="note" title="Why only InvokableRun, no StreamableRun">
+AgentTool is an `InvokableTool`, not a `StreamableTool`. This isn't laziness but semantics: a tool's contract is "one call -> one result." Even if the inner agent runs ten rounds of ReAct and produces a floor full of events, to the outside it must collapse into **one return value**. That collapse is the first meaning of isolation — the main agent doesn't see the sub-agent's process, only its final value.
+</Callout>
+
+## Implementing isolation: a private run environment
+
+The first thing `InvokableRun` (<SourceRef path="adk/agent_tool.go:154" />) does on entry is build a run environment **isolated from the outside world**. This is the heart of the chapter, in three steps.
+
+**Step one, create a private bridgeStore.** Every fresh call does `newBridgeStore()` (<SourceRef path="adk/agent_tool.go:166" />) — last chapter's in-memory store that bridges checkpoints via a fixed key. Giving the sub-agent a **dedicated** bridge means its interrupt state lives in its own space and never pollutes the main agent's checkpoint.
+
+**Step two, spin up a dedicated inner Runner.** `newTypedInvokableAgentToolRunner` (<SourceRef path="adk/agent_tool.go:196" />, implemented at :411) uses that private bridgeStore to construct a Runner serving only this tool call, then runs it:
+
+```go
+runner := newTypedInvokableAgentToolRunner(at.agent, ms, enableStreaming)
+iter = runner.Run(ctx, input,
+    append(extractAndDeriveAgentToolCancelCtx(...),
+        WithCheckPointID(bridgeCheckpointID),
+        withSharedParentSession())...)
+```
+
+**Step three, share only the session's Values, not the control flow.** Look at that `withSharedParentSession()` (<SourceRef path="adk/call_option.go:69" />) — it looks like it's "sharing context," but look closely at what it actually shares. The implementation is in `ctxWithNewTypedRunCtx` (<SourceRef path="adk/runctx.go:537" />):
+
+```go
+if sharedParentSession {
+    if parentSession := getSession(ctx); parentSession != nil {
+        session = &runSession{
+            Values:    parentSession.Values,    // borrow only the key/value store (and its lock)
+            valuesMtx: parentSession.valuesMtx,
+        }
+    }
+}
+```
+
+It shares **only** the parent session's `Values` (that key/value store) with the sub-agent, while **the event list, RunPath, and control-flow state are all freshly created**. That's the precise definition of "isolated context": the sub-agent can read the shared data the main agent put into the session (user preferences, say), but its floor full of intermediate events and its control-flow decisions are all locked inside its own run environment and can't get out.
+
+<Callout kind="key" title="The design key for this chapter">
+AgentTool's isolation isn't "share nothing" but a **precise boundary cut**: **share the data plane, isolate the control plane**. The sub-agent can read shared session Values (data), but its Exit, TransferToAgent, BreakLoop **control actions** never cross the tool boundary. Contrast Chapter 7's transfer — there control genuinely flowed away and the context was genuinely shared whole; here the main agent sits firmly in charge, treating the sub-agent as a black box that "takes an input, returns a result." Composability comes precisely from this clean boundary.
+</Callout>
+
+## Absorb vs. pierce: the judgment that decides everything
+
+Now the best part. Once the sub-agent runs, it emits a stream of events, and `InvokableRun` consumes them in a loop. The crux is this **forwarding gate** (<SourceRef path="adk/agent_tool.go:235" />):
+
+```go
+if gen != nil {
+    if event.Action == nil || event.Action.Interrupted == nil {
+        // ...splice RunPath for observability
+        tmp := copyTypedAgentEvent(event)
+        gen.Send(event)   // forward for the end-user to watch (display only)
+        event = tmp
+    }
+}
+```
+
+Note this gate does exactly one thing: forward the event for the **end-user** to watch (for observability), and **never change the main agent's behavior based on it**. This produces two starkly different fates:
+
+**Exit / TransferToAgent / BreakLoop — "absorbed."** These three control actions flow along with the stream and get forwarded to the user to watch, but the main agent **never reads and never executes** them. Why? Because `InvokableRun` ultimately returns only **one string** (the tool result): after the loop ends, it takes the text of the sub-agent's last message as the return value (<SourceRef path="adk/agent_tool.go:268" />). The sub-agent wants to Exit? It merely ended its own run; the main agent carries on. The sub-agent wants to Transfer to someone? That's its internal affair; the main agent still receives a string. **Control actions, having no reader, degrade into ordinary final text.**
+
+**Interrupted — "pierced."** Only interrupt is the exception. Look at the gate's condition: when `event.Action.Interrupted != nil`, the event is **not** forwarded normally; after the loop ends there's dedicated handling (<SourceRef path="adk/agent_tool.go:251" />):
+
+```go
+if lastEvent != nil && lastEvent.Action != nil && lastEvent.Action.Interrupted != nil {
+    data, existed, err_ := ms.Get(ctx, bridgeCheckpointID)  // fetch interrupt state from the private bridge
+    // ...
+    return "", tool.CompositeInterrupt(ctx, "agent tool interrupt", data,
+        lastEvent.Action.internalInterrupted)               // re-raise, piercing the tool boundary
+}
+```
+
+It fetches the sub-agent's interrupt bytes back from the private bridgeStore, then re-raises the interrupt to the tool's **caller** via last chapter's `tool.CompositeInterrupt` (<SourceRef path="adk/interrupt.go:156" />). So a "wait for human approval" interrupt deep inside a sub-agent can pierce the tool boundary, pierce the main agent, and bubble all the way up to the topmost Runner — exactly the foreshadowing of Chapter 7: "interrupt can propagate."
+
+<Callout kind="warning" title="Why does interrupt pierce while the rest get absorbed?">
+Exit/Transfer/BreakLoop are **local control flow** — they should only affect the sub-agent's own execution; if they could pierce the boundary, a sub-agent could "hijack" the main agent's control and composability would collapse. Interrupt, by contrast, is a **global collaboration event**: a pause that needs human intervention must, no matter how deep the nesting, be known to the very top and be resumable. The source spells this rule out plainly in the `AgentAction` comment (<SourceRef path="adk/interface.go:346" />): "Interrupted is propagated via CompositeInterrupt; Exit, TransferToAgent, BreakLoop are ignored outside the agent tool." `NewAgentTool`'s doc (<SourceRef path="adk/agent_tool.go:80" />) repeats the same contract.
+</Callout>
+
+## Cancel follows the boundary too
+
+Isolation goes beyond data and interrupts; cancel behaves the same way. On entry the tool calls `markAgentToolDescendant()` (near <SourceRef path="adk/agent_tool.go:166" />), stamping itself "I am an AgentTool descendant"; `extractAndDeriveAgentToolCancelCtx` (<SourceRef path="adk/agent_tool.go:325" />) then derives an independent cancel context for the sub-agent. By default, the main agent's cancel only affects itself, and the sub-agent gets torn down as a side effect of `context` cancellation (see last chapter's `CancelMode` comment <SourceRef path="adk/cancel.go:43" />); only when `WithRecursive` is explicitly enabled does cancel recurse down into the AgentTool's interior. This is the same design line again: **the boundary isolates by default; piercing must be declared explicitly**.
+
+## Chapter summary
+
+- AgentTool is an **adapter** (<SourceRef path="adk/agent_tool.go:120" />): internally a full agent, externally only `Info` + `InvokableRun` (<SourceRef path="adk/agent_tool.go:154" />), an `InvokableTool` not a Streamable — "one call, one result" is the first meaning of its isolation.
+- Isolation rests on a **private run environment**: each call builds a fresh `bridgeStore` (<SourceRef path="adk/agent_tool.go:166" />), a dedicated inner Runner (<SourceRef path="adk/agent_tool.go:196" />), and `withSharedParentSession` borrows only the session's `Values` (<SourceRef path="adk/runctx.go:537" />).
+- The design key: **share the data plane, isolate the control plane**.
+- The forwarding gate (<SourceRef path="adk/agent_tool.go:235" />) decides fate: **Exit/Transfer/BreakLoop are absorbed** for lack of a reader (degrading to final text <SourceRef path="adk/agent_tool.go:268" />), while **Interrupted is pierced** through the tool boundary via `CompositeInterrupt` (<SourceRef path="adk/agent_tool.go:251" />).
+- The contract is written in the source comments (<SourceRef path="adk/interface.go:346" />): local control flow is isolated, global collaboration events (interrupts) are propagated.
+- Cancel likewise: no descent by default, `WithRecursive` to recurse — the boundary isolates by default, piercing must be explicit.
+
+That ends Part III. You've now pried the ADK apart end to end — from the skeleton (Runner/flowAgent) to the engine (the ReAct graph) to the long run (TurnLoop) to composition (AgentTool). The next part sinks to a lower layer: the compose orchestration engine that supports all of this — the ADK's interrupt, streaming, and type safety all originate there.

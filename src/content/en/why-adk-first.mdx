@@ -1,0 +1,135 @@
+## Where to start reading Eino
+
+The Eino ecosystem has three repositories, and it's easy to get lost at first:
+
+- **`eino`** — the framework itself. It contains both the low-level orchestration engine (`compose`) and the application-facing **ADK** (Agent Development Kit, the `adk` package).
+- **`eino-ext`** — official extensions: concrete implementations of chat models, vector stores, retrievers, and callback exporters (Langfuse / APMPlus / CozeLoop).
+- **`eino-examples`** — runnable samples and complete apps (this book's running example, `chatwitheino`: an agent app that reads documents, answers questions, and supports human approval).
+
+Many tutorials start from the lowest layer — the `compose` graph engine. This one goes the other way: **it starts from the ADK**, because the ADK is the layer you actually touch every day when writing agents, and it unifies models, tools, memory, interrupts, and multi-agent into one runtime. Get fluent here first; then, when you open the engine underneath (Part IV), every "advanced capability" will have a clear origin.
+
+<Mermaid title="The three repos and their layering" chart={`
+flowchart TB
+  subgraph eino["eino (the framework)"]
+    ADK["adk package · ADK<br/>models/tools/memory/interrupt/multi-agent"]
+    Compose["compose package · graph engine<br/>Runnable / Graph / Checkpoint"]
+    ADK -->|"compiles to a graph, inherits abilities"| Compose
+  end
+  Ext["eino-ext<br/>models / vector stores / retrievers / exporters"]
+  Examples["eino-examples<br/>running example · chatwitheino"]
+  Ext -.->|"implement component interfaces"| eino
+  Examples -.->|"compose together"| eino
+  Examples -.-> Ext
+`} />
+
+
+<Callout kind="key" title="The design key for this chapter">
+The ADK is not "yet another agent framework." It is **a thin adaptation layer sitting on top of the compose graph engine.** Nearly all of its powers — streaming, interrupt, resume, cancel, composability — are not its own inventions; they are *inherited* from the engine below. Internalizing that sentence is where this whole book begins.
+</Callout>
+
+## The ADK worldview: an agent is an "event-stream generator"
+
+In the ADK, an "agent" is not a function that `return`s a string. It is something that **continuously emits a stream of events.** That idea is encoded directly in the core interface `TypedAgent[M]` (see <SourceRef path="adk/interface.go:453" />):
+
+```go
+type TypedAgent[M MessageType] interface {
+    Name(ctx context.Context) string
+    Description(ctx context.Context) string
+    Run(ctx context.Context, input *TypedAgentInput[M],
+        options ...AgentRunOption) *AsyncIterator[*TypedAgentEvent[M]]
+}
+```
+
+Notice `Run` does not return `(Output, error)` — it returns an `*AsyncIterator[...]`, an iterator you keep calling `Next()` on to pull events. The `Agent` we use by default is just the `M = *schema.Message` specialization (<SourceRef path="adk/interface.go:467" />):
+
+```go
+type Agent = TypedAgent[*schema.Message]
+```
+
+Why a stream instead of a single return value? Because a running agent produces many intermediate moments worth surfacing: the model started talking, it wants to call a tool, a sub-agent interrupted to wait for human approval. Modeling all of these as one event stream lets an upper layer (say, a web UI) render them in real time instead of blocking until the agent finishes. Chapter 8 explores this worldview in depth; for now, just build the intuition.
+
+## What's inside a single event
+
+Each `Next()` yields a `TypedAgentEvent[M]` (<SourceRef path="adk/interface.go:419" />), and its shape tells you what the ADK cares about:
+
+```go
+type TypedAgentEvent[M MessageType] struct {
+    AgentName string          // which agent emitted it
+    RunPath   []RunStep       // the framework-managed call path
+    Output    *TypedAgentOutput[M]  // some output (a message or a stream)
+    Action    *AgentAction    // a control-flow action
+    Err       error
+}
+```
+
+`Output` and `Action` are two orthogonal lines: `Output` is *content* (what the model said), `Action` is *control flow* (what to do next). And `AgentAction` (<SourceRef path="adk/interface.go:357" />) enumerates the control-flow decisions an agent can make:
+
+```go
+type AgentAction struct {
+    Exit            bool                   // end the run
+    Interrupted     *InterruptInfo         // pause, awaiting external input
+    TransferToAgent *TransferToAgentAction // hand control to another agent
+    BreakLoop       *BreakLoopAction       // break out of a loop
+    CustomizedAction any
+}
+```
+
+Modeling *control flow* explicitly as data (an `Action` struct) instead of hiding it inside Go's `if/return` is the recurring core move of the ADK. Precisely because control flow is data, it can be serialized, interrupted, and resumed. You'll meet this motif again and again.
+
+## Runner: your entry point to an agent
+
+You will almost never call `agent.Run` directly. The real entry point is the `Runner` (<SourceRef path="adk/runner.go:55" />), which wraps an agent and uniformly handles callbacks, naming, run paths, cancel monitoring, and — most importantly — **checkpoint persistence on interrupt**:
+
+```go
+type TypedRunner[M MessageType] struct {
+    a               TypedAgent[M]
+    enableStreaming bool
+    store           CheckPointStore
+}
+```
+
+Using it is two steps — construct, then run:
+
+```go
+runner := adk.NewRunner(ctx, adk.RunnerConfig{
+    Agent:           myAgent,
+    EnableStreaming: true,
+})
+
+iter := runner.Query(ctx, "What's the weather in Beijing tomorrow?")
+for {
+    event, ok := iter.Next()
+    if !ok {
+        break // stream exhausted
+    }
+    // handle event...
+}
+```
+
+`Query` (<SourceRef path="adk/runner.go:108" />) is sugar over `Run`: it wraps a single string into one user message and calls `Run`. This `for { Next() }` loop is the one canonical way to consume any agent's output — every later chapter uses it.
+
+<Callout kind="note" title="Why checkpointing lives at the Runner layer">
+The `Runner` holds the `CheckPointStore`. That's no accident: interrupt/resume must survive across processes and requests, so someone *outside* the agent must keep the state. The Runner is that keeper. You'll use it in Chapter 5; Chapters 13 and 15 show how it bridges state down into the compose engine.
+</Callout>
+
+## How the ADK sits on top of compose
+
+We claimed the ADK is a "thin adaptation." Here's the evidence. `ChatModelAgent` (the star of the next chapter) does not hand-roll a loop internally — it **builds a real compose graph and compiles it** (see <SourceRef path="adk/chatmodel.go:1139" />): it assembles a pipeline with `compose.NewChain[...]()`, compiles it into a `Runnable` via `chain.Compile(ctx, ...)`, then `Invoke`s / `Stream`s it.
+
+Even the checkpoint types are direct re-exports of the layer below (<SourceRef path="adk/runner.go:64" />):
+
+```go
+type CheckPointStore = core.CheckPointStore
+```
+
+That's why this tutorial goes "ADK first, engine last": the streaming, interrupt, and resume you use at the ADK layer all bottom out in the compose engine. Build complete usage intuition in the ADK first; Part IV then lifts the hood, and you'll get a coherent "so *that's* how" feeling instead of reassembling upper-layer powers from a pile of low-level primitives.
+
+## Chapter summary
+
+- Eino has three repos: `eino` (framework), `eino-ext` (extensions), `eino-examples` (samples).
+- The ADK unifies models, tools, memory, interrupts, and multi-agent into one runtime — the layer you write agents against day to day.
+- Core worldview: **an agent is an event-stream generator**; control flow is modeled explicitly as `AgentAction` data.
+- The `Runner` is the unified entry point and owns checkpoint persistence on interrupt.
+- The ADK sits on the `compose` graph engine; its advanced powers are inherited.
+
+Next, we'll get the first `ChatModelAgent` running and nail down the full shape of `Runner.Run` / `Query` and event-stream consumption.

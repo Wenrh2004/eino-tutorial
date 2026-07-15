@@ -1,0 +1,91 @@
+## When an agent needs to "wait for a human"
+
+Some actions can't be left to an agent's discretion: refunds, sending email, deleting data, placing orders. The ideal flow is — the agent runs up to that step, **pauses**, hands "I want to run approve(refund ￥500)" to a human for approval, the human clicks yes, and it **continues from where it paused**, as if it never stopped.
+
+This is human-in-the-loop (HITL). It makes harsh demands of the framework: on pause it must fully save the *entire run's state* (the process might even exit), and on resume it must restore precisely to that node. Eino makes this a first-class capability. Here's the full loop:
+
+<Viz name="checkpoint-resume" />
+
+Following the demo, one HITL cycle passes through seven phases: run → interrupt → persist → wait → resume → continue → done. Note the two flows in the diagram: **horizontal** is control flowing across the nodes, **vertical** is the same state being serialized into a checkpoint and later rehydrated. They meet at the interrupting node (`ApprovalTool`) — which is exactly the key to understanding HITL.
+
+## An interrupt is not an error — it's a "legal pause"
+
+A beginner's first instinct is to express "needs human intervention" with an `error`. Eino explicitly disagrees: an interrupt is *normal control flow*, not an exception.
+
+When a tool needs a human, it calls `Interrupt` or `StatefulInterrupt` (<SourceRef path="adk/interrupt.go" />):
+
+```go
+// no internal state to save
+func Interrupt(ctx context.Context, info any) *AgentEvent
+
+// also save the agent's internal state, restored on resume
+func StatefulInterrupt(ctx context.Context, info any, state any) *AgentEvent
+```
+
+`info` is for the human: "I want to refund ￥500, please approve." The difference: `StatefulInterrupt` also serializes and saves `state`, handing it back verbatim on resume — use it when your tool computed halfway before pausing and needs to continue.
+
+They return not an `error` but an `AgentEvent` carrying `Action.Interrupted` (<SourceRef path="adk/interrupt.go:59" />). Recall Chapter 1: `AgentAction` models control flow as data, and `Interrupted` is one such action. Because it's data and not an exception, it can be captured by the Runner, serialized, and survive across processes.
+
+<Callout kind="key" title="The design key for this chapter">
+Modeling "pause" as an **Action (data)** rather than an **error (exception)** is the bedrock of the entire HITL mechanism. An exception can only be `catch`ed, but data can be **serialized**. Precisely because an interrupt is data, the Runner can `gob`-encode it together with the whole run state into a checkpoint, truly "freezing" the run — even if the process exits.
+</Callout>
+
+## Checkpoint: freezing the whole run's state
+
+After an interrupt fires, the Runner serializes the entire run state — channel values, per-node state, and the **Address that locates it** — with `gob` and writes it into the `CheckPointStore`.
+
+The `Address` is crucial: it records *which node* the run paused at. On resume it's used to find the pause point exactly, rather than re-running from scratch. This addressing machinery comes from the compose engine underneath (detailed in Chapter 23); the ADK bridges the two layers' checkpoints via a `bridgeStore` (<SourceRef path="adk/interrupt.go:315" />).
+
+To enable persistence, just give the Runner a store and pass a checkpoint id at run time:
+
+```go
+runner := adk.NewRunner(ctx, adk.RunnerConfig{
+    Agent:           myAgent,
+    CheckPointStore: myStore, // your implementation, or an in-memory one
+})
+
+iter := runner.Query(ctx, "Please refund this order",
+    adk.WithCheckPointID("session-42"))
+```
+
+Once state is on disk, the process can safely exit. The user can approve now or come back tomorrow — the checkpoint lies quietly in the store, holding no runtime resources.
+
+## Resume: continuing seamlessly from the pause point
+
+After the human approves, call the `Resume` family with the same checkpoint id (<SourceRef path="adk/runner.go" />):
+
+```go
+// Strategy 1: resume all interrupt points (most common)
+iter, err := runner.Resume(ctx, "session-42")
+
+// Strategy 2: precisely specify which to resume and what data to feed
+iter, err := runner.ResumeWithParams(ctx, "session-42", &adk.ResumeParams{
+    Targets: map[string]any{
+        "ApprovalTool": "approved", // located by Address, injecting the approval
+    },
+})
+```
+
+`Resume` (<SourceRef path="adk/runner.go:124" />) is "implicitly resume all"; `ResumeWithParams` (<SourceRef path="adk/runner.go:147" />) lets you control precisely by `Address`: addresses in `Targets` receive `isResumeFlow = true` and get the data you inject, while interrupt points *not* in `Targets` decide for themselves how to proceed.
+
+Under the hood: deserialize the whole run state by checkpoint id, return to the paused node by `Address`, hand it the data you injected, and the horizontal run flow continues from the pause point — just like step 6 of the demo, where the vertical checkpoint flow and the horizontal run flow "reconnect" at the very same node.
+
+<Callout kind="note" title="Three typical HITL scenarios">
+The same mechanism covers three common needs: **approval** (inject approved/rejected), **edit-args** (replace the tool's arguments via `ResumeParams` on resume), and **follow-up** (inject the user's extra information). They differ only in "what data you inject on Resume"; the mechanism is identical.
+</Callout>
+
+## A symmetry easy to overlook
+
+Recall Chapter 2's conclusion: **on resume, the streaming mode comes from the checkpoint, not the caller.** That's not an isolated detail but a HITL discipline: resume must faithfully restore *all* of the context at interrupt time — streaming or not, history messages, node state, none may change. Otherwise "as if it never paused" is an empty promise.
+
+It also explains why a checkpoint stores "the whole run's state" rather than "a few variables": any omitted context would make post-resume behavior diverge from before the pause.
+
+## Chapter summary
+
+- HITL lets an agent pause before a critical action, wait for a human, and continue seamlessly.
+- An interrupt is **data (Action), not an exception (error)**: `Interrupt` / `StatefulInterrupt` return an event carrying `Interrupted`, which is serializable.
+- A checkpoint `gob`-freezes the whole run state + `Address` into the store; the process may safely exit.
+- `Resume` resumes all, `ResumeWithParams` injects data precisely by `Address`; together they cover approval / edit-args / follow-up.
+- Resume must faithfully restore all context (including streaming mode) — that's the prerequisite for "as if it never paused."
+
+That completes Part I's single-agent throughline. Next comes **middleware**: how to stack capabilities like a filesystem, task planning, and summarization onto an agent without touching its core.

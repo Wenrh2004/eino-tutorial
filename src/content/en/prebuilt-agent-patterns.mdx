@@ -1,0 +1,115 @@
+## Three prebuilt agents, three composition paradigms
+
+In Chapter 7 you got supervisor, DeepAgent, and plan-execute running. This chapter takes a higher vantage: not "how to use them" but "which **paradigm for wiring agents together** each one represents." Because the ADK's three prebuilts aren't three isolated tools — they're **reference implementations** of three composition philosophies. Understand them and you hold three basic templates for building any multi-agent system.
+
+The three paradigms, in one line each:
+
+| Prebuilt | Composition paradigm | In a sentence | Context |
+| --- | --- | --- | --- |
+| Supervisor | **control transfer** | central dispatch, baton-passing | shared |
+| Plan-Execute | **workflow orchestration** | fixed sequence: plan → execute → replan | structured passing |
+| DeepAgent | **agent-as-tool** | nested calls, isolated execution | isolated |
+
+<Mermaid title="Control flow across the three composition paradigms" chart={`
+flowchart TB
+  subgraph S["Supervisor · control transfer"]
+    SUP["supervisor"] -->|transfer| EA["expert A"]
+    EA -->|hand back| SUP
+    SUP -->|transfer| EB["expert B"]
+    EB -->|hand back| SUP
+  end
+  subgraph P["Plan-Execute · workflow orchestration"]
+    PL["Planner"] --> LP["Loop"]
+    LP --> EX["Executor"] --> RP["Replanner"] --> LP
+  end
+  subgraph D["DeepAgent · agent-as-tool"]
+    MAIN["main agent"] -->|"task tool call"| SUB["sub-agent (isolated context)"]
+    SUB -->|"returns result"| MAIN
+  end
+`} />
+
+
+## Paradigm 1: Supervisor — compose via "control transfer"
+
+`supervisor.New` (<SourceRef path="adk/prebuilt/supervisor/supervisor.go:101" />) represents the most intuitive, most "anthropomorphic" composition: a supervisor sits in the center, hands work to specialists, and specialists **hand back** to the supervisor when done. Its implementation does one core thing — wrap each sub-agent to force "transfer back to the supervisor":
+
+```go
+// inside supervisor.New (simplified)
+for _, subAgent := range conf.SubAgents {
+    subAgents = append(subAgents, adk.AgentWithDeterministicTransferTo(ctx,
+        &adk.DeterministicTransferConfig{
+            Agent:        subAgent,
+            ToAgentNames: []string{supervisorName}, // must return to supervisor
+        }))
+}
+```
+
+It's built on **control transfer + full context sharing**: all agents soak in one session, each other's intermediate steps mutually visible. This gives the intuition of "human-like collaboration" but also the cost from Chapter 9 — control flow is hard to isolate, interrupts hard to restore cleanly.
+
+<Callout kind="warning" title="Marked NOT RECOMMENDED, yet worth reading">
+`supervisor.New`'s doc (<SourceRef path="adk/prebuilt/supervisor/supervisor.go:98" />) plainly says **NOT RECOMMENDED**: transfer + shared context hasn't proven more effective empirically. But as a minimal reference implementation of the "control transfer paradigm," its teaching value is high — it lets you see firsthand where the "shared context" road leads, so you truly understand why the other two are better. **A paradigm doesn't lose its learning value just because it's discouraged.**
+</Callout>
+
+## Paradigm 2: Plan-Execute — compose via "workflow orchestration"
+
+`planexecute.New` (<SourceRef path="adk/prebuilt/planexecute/plan_execute.go:862" />) represents a wholly different idea: rather than letting the model decide on the fly "who's next," it orchestrates several agents with a **fixed temporal structure**. Its implementation is refreshingly honest about this — it has almost no new logic, just wiring together orchestration primitives:
+
+```go
+// plan_execute.go's New (simplified)
+loop, _ := adk.NewLoopAgent(ctx, &adk.LoopAgentConfig{
+    SubAgents:     []adk.Agent{cfg.Executor, cfg.Replanner},
+    MaxIterations: maxIterations, // default 10
+})
+return adk.NewSequentialAgent(ctx, &adk.SequentialAgentConfig{
+    SubAgents: []adk.Agent{cfg.Planner, loop}, // plan first, then loop
+})
+```
+
+Unpacked, it's `Sequential(Planner, Loop(Executor, Replanner))`. Run `Planner` once to produce a plan, then enter a `Loop` of "execute one step → replan." When `Replanner` (<SourceRef path="adk/prebuilt/planexecute/plan_execute.go:807" />) judges the task done, it triggers `BreakLoopAction` via a `respond` tool to break the loop.
+
+<Callout kind="key" title="The design key for this chapter">
+Plan-Execute reveals something profound: **multi-agent "orchestration" and the compose engine's "orchestration" are the same thing.** The workflow primitives `NewSequentialAgent` (<SourceRef path="adk/workflow.go:686" />), `NewLoopAgent` (<SourceRef path="adk/workflow.go:704" />), `NewParallelAgent` (<SourceRef path="adk/workflow.go:695" />) turn "how agents proceed among themselves" into a declarable graph — rather than something scattered in prompts for the model to guess. This is Eino's throughline: **whatever can be expressed with deterministic structure shouldn't be left to the model's improvisation.** Control transfer hands timing to the model; workflow orchestration hands timing to code — the latter is testable, reproducible, and reasoned-about.
+</Callout>
+
+That's why plan-execute suits "many-step tasks needing mid-course correction": the plan is explicit data, execution is a deterministic loop, and correction is a fixed stage inside the loop. You can read the whole chain statically.
+
+## Paradigm 3: DeepAgent — compose via "agent-as-tool"
+
+`deep.New` (<SourceRef path="adk/prebuilt/deep/deep.go:171" />) represents the composition style Chapter 9 favored, and the one most recommended in engineering terms. Its essence is clearest in the implementation: the sub-agents aren't spread out — a **task tool middleware** collapses them into a **single `task` tool** (<SourceRef path="adk/prebuilt/deep/deep.go:131" />).
+
+```go
+// inside NewTyped (simplified): pack sub-agents into a task tool middleware
+if !cfg.WithoutGeneralSubAgent || len(cfg.SubAgents) > 0 {
+    tt, _ := typedTaskToolMiddleware(ctx, ..., cfg.SubAgents, ...)
+    handlers = append(handlers, tt) // sub-agents → one middleware → one task tool
+}
+return adk.NewTypedChatModelAgent(ctx, &adk.TypedChatModelAgentConfig[M]{
+    ...
+    Handlers: append(handlers, cfg.Handlers...),
+})
+```
+
+Note the cleverness: DeepAgent **is itself just an ordinary `ChatModelAgent`** — it merely stacks the "dispatch sub-agents" capability on as a tool, via the middleware mechanism from Chapter 10. Sub-agents execute in isolated contexts; the main agent only gets `task`'s return value. The three properties — composable, controllable, interrupt-propagating — follow from this (implementation details in Chapter 16).
+
+The elegance here is **paradigmatic self-consistency**: it introduces no new concept called "multi-agent." Instead it **reduces** multi-agent back to the existing primitives "agent + tool + middleware." One fewer concept means one fewer special case.
+
+## How to choose among the three
+
+Placing all three together, the selection criteria become clear:
+
+- **Who decides the timing?** Model on the fly → transfer (supervisor); code, fixed → workflow (plan-execute); main agent on demand → agent-as-tool (DeepAgent).
+- **Do you need context isolation?** Need isolation, composability, interrupt propagation → DeepAgent (the default first choice).
+- **Does the task have a clear multi-step structure?** Yes, and needs mid-course correction → plan-execute.
+- **When to use supervisor?** Rarely recommended in production; but when you want to understand the "shared-context paradigm" pedagogically, it's the best live specimen.
+
+Three prebuilts are three templates Eino hands you. In real systems you'll often **mix** them: a DeepAgent's sub-agent can internally be a plan-execute; a workflow node can carry an agent-as-tool. Paradigms nest and combine — precisely the dividend of the "composition over transfer" philosophy.
+
+## Chapter summary
+
+- The three prebuilt agents are reference implementations of three composition paradigms: supervisor = **control transfer**, plan-execute = **workflow orchestration**, DeepAgent = **agent-as-tool**.
+- Supervisor (<SourceRef path="adk/prebuilt/supervisor/supervisor.go:101" />) implements hub-and-spoke by forcing "transfer back to supervisor," shared context — NOT RECOMMENDED, but a live specimen for understanding the transfer paradigm.
+- Plan-Execute (<SourceRef path="adk/prebuilt/planexecute/plan_execute.go:862" />) = `Sequential(Planner, Loop(Executor, Replanner))`, revealing "multi-agent orchestration = compose workflow orchestration."
+- DeepAgent (<SourceRef path="adk/prebuilt/deep/deep.go:171" />) collapses sub-agents into a single `task` tool, **reducing** multi-agent to "agent + tool + middleware," paradigmatically self-consistent.
+- Selection criteria: who decides timing, whether isolation is needed, whether there's multi-step structure; the three nest and mix.
+
+Only one piece of the design puzzle remains: why did v0.9 **generify** the whole ADK? The next chapter covers how `AgenticMessage` and `[M MessageType]` let chat and agentic reuse one system.

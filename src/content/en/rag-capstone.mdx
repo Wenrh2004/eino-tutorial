@@ -1,0 +1,141 @@
+## A Real RAG Pipeline — That Turns Out to Be a Workflow
+
+Every orchestration mechanism from the earlier chapters comes on stage together here. We read `chatwitheino`'s `answer_from_document` tool closely — a RAG pipeline that retrieves from an uploaded document and synthesizes a cited answer. Most people's RAG is a lump of glue code: read the file, chunk it, score, sort, build a prompt, wire it up with a `for` loop. Eino instead writes it as a single `compose.Workflow`: **load → chunk → score → filter → answer**, five nodes. The value here isn't any one API — it's watching the Part IV machinery (field mapping, BatchNode concurrency, fan-out/fan-in) **mesh inside one real pipeline**, then get wrapped whole as a single Agent tool.
+
+## The Tool Contract: Two Structs Pin the I/O
+
+First, what this tool looks like from the outside. Its input and output are each a struct, and the `jsonschema` descriptions on the JSON tags are read by `utils.InferTool` to **generate the tool's parameter schema automatically** — you never hand-write JSON Schema (<SourceRef path="quickstart/chatwitheino/rag/rag.go:64" />):
+
+```go
+// Input's JSON tags are used by utils.GoStruct2ToolInfo to generate the tool schema.
+type Input struct {
+    FilePath string `json:"file_path" jsonschema:"description=Absolute path to the uploaded document file"`
+    Question string `json:"question"  jsonschema:"description=The question to answer from the document"`
+}
+
+// Output is the structured result returned by the tool.
+type Output struct {
+    Answer  string   `json:"answer"`
+    Sources []string `json:"sources"` // key excerpts used to produce the answer
+}
+```
+
+To the model, this tool is just `answer_from_document`, taking `{file_path, question}` and returning `{answer, sources}`. However complex the pipeline is inside, the caller sees none of it — which is exactly the point of "wrapping orchestration as a tool" (Ch24): **an entire graph, exposed as one callable tool**.
+
+## Five Nodes: RAG Decomposed into a Workflow
+
+`buildWorkflow` draws those five steps explicitly as a Workflow (<SourceRef path="quickstart/chatwitheino/rag/rag.go:122" />). Note the `AddInput` hanging off each node — it declares where that node's data comes from:
+
+```go
+wf := compose.NewWorkflow[Input, Output]()
+
+// load: read the file, emit a single Document
+wf.AddLambdaNode("load", /* os.ReadFile */).AddInput(compose.START)
+
+// chunk: split each Document into ~800-char pieces
+wf.AddLambdaNode("chunk", /* splitIntoChunks */).AddInput("load")
+
+// score: score each chunk in parallel (field mapping detailed below)
+wf.AddLambdaNode("score", /* BatchNode scoring */). /* field-mapping fan-in */
+
+// filter: sort by score, keep Top-3
+wf.AddLambdaNode("filter", /* sort + top-k */).AddInput("score")
+
+// answer: synthesize a cited answer from Top-K (field-mapping fan-in)
+wf.AddLambdaNode("answer", /* synthesize */). /* field-mapping fan-in */
+
+wf.End().AddInput("answer")
+```
+
+`load → chunk → filter` is the plainest linear dependency: one node's whole output feeds the next. What's worth studying are the `score` and `answer` nodes — their input isn't "the previous node's whole output" but is **assembled from several upstreams**.
+
+## Field-Level Fan-In: Sharing Question Across Non-Adjacent Nodes
+
+The `score` node needs two things to do its job: **the chunks to score** (from `chunk`) and **the original question** (from `START` at the very top). The problem: `chunk`'s output type is `[]*schema.Document`, which contains no Question at all — and forcing Question to thread through the output type of every node (load, chunk) would pollute the entire pipeline.
+
+Workflow's **field mapping** solves this: a node's input struct can be assembled **field by field** from different upstreams (<SourceRef path="quickstart/chatwitheino/rag/rag.go:158" />):
+
+```go
+wf.AddLambdaNode("score", compose.InvokableLambda(
+    func(ctx context.Context, in scoreIn) ([]scoredChunk, error) {
+        // in.Chunks comes from chunk; in.Question comes from START
+        ...
+    },
+)).
+    AddInputWithOptions("chunk",
+        []*compose.FieldMapping{compose.ToField("Chunks")},        // chunk's whole output → scoreIn.Chunks
+        compose.WithNoDirectDependency()).
+    AddInputWithOptions(compose.START,
+        []*compose.FieldMapping{compose.MapFields("Question", "Question")}, // START.Question → scoreIn.Question
+        compose.WithNoDirectDependency())
+```
+
+The struct `scoreIn{Chunks, Question}` is "assembled" exactly this way: the `Chunks` field takes `chunk`'s whole output, and the `Question` field is pulled directly from `START`'s `Question` field. The `answer` node is the same — in its `synthIn{TopK, Question}`, `TopK` takes `filter` while `Question` is again projected straight from `START` (<SourceRef path="quickstart/chatwitheino/rag/rag.go:198" />). So the original question is **wired by field only into the two nodes that need it**, instead of being forced through the whole pipeline.
+
+The `WithNoDirectDependency` here is the finishing touch: it says "I want this upstream's **data**, but don't add an extra **execution-dependency edge**." Because execution order is already guaranteed by the main chain `START → load → chunk → score`, adding a "must wait for START" edge onto `score` would be pure redundancy — data flow and control flow are **cleanly separated** here.
+
+<Callout kind="key" title="The Design Key of This Chapter">
+A RAG pipeline isn't steps piled together — it's **Workflow field mapping expressing "data dependency" precisely down to the field level**. Both `score` and `answer` need the `Question` from the very top, but `Question` doesn't have to pollute the output types of `load` and `chunk` — it's wired via `MapFields` into just the nodes that truly need it. `WithNoDirectDependency` goes one step further: it splits **data dependency** (whose value do I need) from **control dependency** (whom must I wait for). This is the book-wide key manifesting at the data layer: **the shape of the graph is the shape of the data flow** — only this time down to a single struct field.
+</Callout>
+
+## Parallel Scoring: BatchNode Folds Fan-Out/Fan-In into One Node
+
+Inside `score` hides one of the book's most central moves: **fan-out/fan-in**. The document is chunked into dozens or hundreds of pieces, and each must independently ask the model "how relevant is this piece to the question (0–10)?" Scoring serially would be unbearably slow, so it's parallelized with `batch.NewBatchNode` (<SourceRef path="quickstart/chatwitheino/rag/rag.go:124" />):
+
+```go
+scoreWF := newScoreWorkflow(cm) // the inner workflow that scores one chunk
+scorer := batch.NewBatchNode(&batch.NodeConfig[scoreTask, scoredChunk]{
+    Name:           "ChunkScorer",
+    InnerTask:      scoreWF,
+    MaxConcurrency: 5, // at most 5 chunks scored at once
+})
+```
+
+BatchNode is a packaging of Part IV's "fan-out/fan-in": given a `[]scoreTask`, it **fans out** into N concurrent sub-tasks (each running `InnerTask`), then **fans in** the N `scoredChunk` results back into one slice. `MaxConcurrency: 5` is the backpressure gate — no matter how many chunks there are, only 5 hit the model at once, keeping downstream QPS from blowing up. This is exactly where this chapter's companion interactive demo — "one output fanned out to many lanes, then merged back to one" — lands in real code.
+
+The scoring function itself demonstrates one more engineering rule: **local failure doesn't sink the whole batch**. A chunk's model call erroring out, or returning unparseable JSON, is degraded to "score 0" rather than aborting the batch (<SourceRef path="quickstart/chatwitheino/rag/rag.go:158" />) — one failed score shouldn't crash the whole document's Q&A.
+
+## filter and answer: Converging from "All Chunks" to "One Answer"
+
+`filter` sorts the scored chunks descending and keeps the top 3 with score ≥ 3 (<SourceRef path="quickstart/chatwitheino/rag/rag.go:175" />) — the "recall then rerank, keep only the most relevant" step of RAG. `answer` does the final synthesis: if `TopK` is empty (the document has no relevant content at all), it returns a "not found" line directly; otherwise it stitches the Top-K excerpts into a prompt, has the model produce an answer **with citation numbers**, and puts the used excerpts verbatim into `Output.Sources` (<SourceRef path="quickstart/chatwitheino/rag/rag.go:198" />).
+
+At this point the entire RAG pipeline — read, chunk, parallel-score, rerank, synthesize — is expressed purely as Workflow nodes and edges, without a single line of loose orchestration glue.
+
+## Wrapping the Whole Workflow as One Tool
+
+The last step turns this Workflow into a tool the model can call. `BuildTool` does it with `graphtool.NewInvokableGraphTool` (<SourceRef path="quickstart/chatwitheino/rag/rag.go:109" />):
+
+```go
+func BuildTool[M adk.MessageType](ctx context.Context, cm model.BaseModel[M]) (tool.BaseTool, error) {
+    wf := buildWorkflow(cm)
+    return graphtool.NewInvokableGraphTool[Input, Output](
+        wf, "answer_from_document",
+        "Search a large uploaded document ... synthesize a cited answer ...",
+    )
+}
+```
+
+`NewInvokableGraphTool` does two things (<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:42" />): first, it uses `utils.GoStruct2ToolInfo[Input]` to generate the tool schema from `Input`'s tags; second, it **compiles and runs this graph on demand per invocation**, with a built-in checkpoint store — meaning this RAG graph **can be interrupted mid-execution and resumed later** (the next chapter's human approval relies on exactly this). So between "an entire Workflow" and "one Agent tool" sits only this thin `graphtool` adapter.
+
+<Mermaid title="answer_from_document: One RAG Workflow" chart={`
+flowchart TB
+  START(["START · {FilePath, Question}"]) --> LOAD["load · read file"]
+  LOAD --> CHUNK["chunk · split into paragraphs"]
+  CHUNK -->|"Chunks"| SCORE["score · BatchNode parallel scoring (≤5)"]
+  SCORE --> FILTER["filter · keep Top-3 (score≥3)"]
+  FILTER -->|"TopK"| ANSWER["answer · synthesize cited answer"]
+  ANSWER --> STOP(["END · {Answer, Sources}"])
+  START -.->|"Question field projected"| SCORE
+  START -.->|"Question field projected"| ANSWER
+`} />
+
+## Chapter Summary
+
+- `answer_from_document` is a complete RAG pipeline (read → chunk → score → rerank → synthesize), but it's not glue code — it's a single `compose.Workflow` (<SourceRef path="quickstart/chatwitheino/rag/rag.go:122" />).
+- The tool's I/O is pinned by two structs with `jsonschema` tags; the schema is generated automatically by `utils.InferTool` (<SourceRef path="quickstart/chatwitheino/rag/rag.go:64" />).
+- **Field-level fan-in**: `score` and `answer` use `AddInputWithOptions` + `MapFields` to assemble their input field-by-field from multiple upstreams, wiring `Question` only into the nodes that need it rather than polluting the whole pipeline (<SourceRef path="quickstart/chatwitheino/rag/rag.go:158" />).
+- `WithNoDirectDependency` separates **data dependency** from **control dependency**: take the value, but don't add a redundant execution edge.
+- **BatchNode** (`MaxConcurrency: 5`) is a packaging of Part IV's fan-out/fan-in: a batch of chunks fans out into parallel scoring, then merges back into one slice; local failure degrades to score 0 without sinking the batch (<SourceRef path="quickstart/chatwitheino/rag/rag.go:124" />).
+- The whole Workflow is wrapped by `graphtool.NewInvokableGraphTool` into a callable, interruptible/resumable tool (<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:42" />).
+
+Next chapter, we give this Agent its "eyes": callback-driven observability, the Eino Dev visual debugger, and how to deploy it.

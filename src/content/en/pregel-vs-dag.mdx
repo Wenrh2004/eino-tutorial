@@ -1,0 +1,157 @@
+## One loop, two worldviews
+
+Last chapter you saw that everything in the ADK — ReAct, multi-agent, interrupt/resume — ultimately compiles down to a compose **graph** to run. But the "graph" itself has two starkly different ways of executing. This chapter drills into the very core of the compose engine: how a single execution loop switches between two worldviews just by swapping one component.
+
+Here's the conclusion first, verified piece by piece below: compose has exactly **one** run loop, but it accepts two "channel" strategies — one called **Pregel** (tolerates cycles) and one called **DAG** (forbids cycles, propagates skips). The reason the ReAct loop you met in Parts I/III can have a back edge is precisely that it runs in Pregel mode.
+
+<Mermaid title="One super-step loop + two swappable channel strategies" chart={`
+flowchart TB
+  LOOP["the one run loop (super-step)<br/>submit tasks → wait → compute next<br/>compose/graph_run.go"]
+  LOOP -->|"asks channel.get() each round"| CH{"channel strategy"}
+  CH --> PREGEL["Pregel channel<br/>activate when any upstream arrives<br/>tolerates cycles · has maxSteps cap"]
+  CH --> DAG["DAG channel<br/>activate when all deps ready<br/>forbids cycles · propagates skip"]
+  PREGEL -.-> REACT["ReAct back edge relies on this"]
+`} />
+
+
+## The one and only run loop
+
+The heart of the whole engine is `runner.run` in `graph_run.go` (<SourceRef path="compose/graph_run.go:109" />). Invoke or Transform, Pregel or DAG — everything funnels into it. The loop body itself is remarkably tidy (<SourceRef path="compose/graph_run.go:241" />):
+
+```go
+// Main execution loop.
+for step := 0; ; step++ {
+    // ...check for ctx cancellation
+    if !r.dag && step >= maxSteps {          // <- one of the only mode-dependent branches
+        return nil, newGraphRunError(ErrExceedMaxSteps)
+    }
+    // 1. submit next tasks
+    // 2. get completed tasks
+    // 3. calculate next tasks
+    err = tm.submit(nextTasks)               // submit this round's tasks
+    // ...
+    completedTasks, canceled, canceledTasks := tm.wait()  // wait for completion
+    // ...calculateNextTasks computes the next round
+}
+```
+
+Each round (the source calls it a super-step) does exactly three things: **submit tasks → wait for completion → compute the next batch**. Note the line `if !r.dag && step >= maxSteps` (<SourceRef path="compose/graph_run.go:249" />) — one of the few spots in the loop that looks at the mode: Pregel mode (`!r.dag`) has a max-super-step ceiling as a backstop (remember ReAct's `MaxIterations=20` from Chapter 14? that's it), while DAG mode, being acyclic and unable to run forever, sets no such ceiling.
+
+<Callout kind="note" title="Where the super-step comes from">
+"Super-step" is a term from the Pregel model in graph computing: slice the computation into rounds, where each round runs all "ready" nodes once in parallel, synchronizing between rounds. Eino's `for step` loop is the implementation of super-steps. Grasp this and the next section's "channel decides who's ready" makes sense — **the loop advances rounds; the channel decides whether each node should fire this round**.
+</Callout>
+
+## The switch that changes semantics: the channel interface
+
+So who decides "who fires this round"? A `channel` hanging in front of each node. It's an interface (<SourceRef path="compose/graph_manager.go:29" />):
+
+```go
+type channel interface {
+    reportValues(map[string]any) error       // an upstream delivered a value
+    reportDependencies([]string)             // an upstream: "I'm done"
+    reportSkip([]string) bool                // an upstream: "I'm not taking this path"
+    get(bool, string, *edgeHandlerManager) (any, bool, error)  // am I ready this round?
+    // ...
+}
+```
+
+The key is the `get` method: every round the loop asks each channel "are you ready?" — **return true and the corresponding node fires this round**. Almost the entire difference between Pregel and DAG is condensed into the condition of this `get`.
+
+<Callout kind="key" title="The design key for this chapter">
+compose **decouples** "execution scheduling" from "readiness judgment" into two layers: on top, a mode-agnostic super-step loop (<SourceRef path="compose/graph_run.go:241" />); underneath, a swappable `channel` strategy (<SourceRef path="compose/graph_manager.go:29" />). To change execution semantics you don't touch the loop — you just swap the channel implementation. **The seemingly fundamental "cyclic vs acyclic" distinction is, architecturally, just one strategy swap** — the very embodiment of the "composition over branching" design philosophy at the engine's base: the two engines aren't two codebases but one loop plus two channels.
+</Callout>
+
+## Pregel: fire when any upstream arrives
+
+Pregel's channel implementation is astonishingly plain (<SourceRef path="compose/pregel.go:25" />):
+
+```go
+type pregelChannel struct {
+    Values      map[string]any   // values delivered by upstreams, accumulated here
+    mergeConfig FanInMergeConfig
+}
+```
+
+Its `get` judgment is a single sentence (<SourceRef path="compose/pregel.go:55" />):
+
+```go
+func (ch *pregelChannel) get(...) (any, bool, error) {
+    if len(ch.Values) == 0 {
+        return nil, false, nil    // no upstream has arrived yet -> not ready
+    }
+    // ...ready as long as there's a value
+}
+```
+
+**As long as any one upstream has delivered a value, the node fires next round** — that's the `AnyPredecessor` semantics (definition at <SourceRef path="compose/types.go:42" />). It keeps no accounting of dependencies: `reportSkip` just returns `false`, `reportDependencies` is an empty function (<SourceRef path="compose/pregel.go:90" />).
+
+Precisely because it "fires the moment any upstream arrives and never tracks whether dependencies are complete," Pregel naturally tolerates **cycles**. ReAct's `AfterToolCalls → ChatModel` back edge delivers another value to ChatModel's channel in the next super-step, so it fires again — and the loop turns, never deadlocking. The source comment states this design plainly (<SourceRef path="compose/graph.go:42" />): "runTypePregel ... Can have cycles in graph."
+
+## DAG: fire when all upstreams are settled, and propagate skips
+
+DAG's channel is far more complex (<SourceRef path="compose/dag.go:50" />), because it keeps accounts:
+
+```go
+type dagChannel struct {
+    ControlPredecessors map[string]dependencyState  // each control predecessor: waiting/ready/skipped
+    Values              map[string]any
+    DataPredecessors    map[string]bool             // each data predecessor: arrived or not
+    Skipped             bool
+    // ...
+}
+```
+
+Its `get` (<SourceRef path="compose/dag.go:128" />) requires **every predecessor to have given an account** before firing:
+
+```go
+for _, state := range ch.ControlPredecessors {
+    if state == dependencyStateWaiting {
+        return nil, false, nil    // a control predecessor still waiting -> not ready
+    }
+}
+for _, ready := range ch.DataPredecessors {
+    if !ready {
+        return nil, false, nil    // a data predecessor hasn't arrived -> not ready
+    }
+}
+```
+
+That's the `AllPredecessor` semantics (<SourceRef path="compose/types.go:45" />). But a question arises: if the graph has a branch and one path isn't chosen, the nodes on that path will never "arrive" — won't the downstream wait forever?
+
+The answer is **skip propagation**. When a branch isn't taken, it calls `reportSkip` (<SourceRef path="compose/dag.go:106" />) to mark itself "skipped"; if **all** of a node's control predecessors are skipped, it too gets marked `Skipped=true` and returns `true` — that return value triggers `channelManager.reportBranch` (<SourceRef path="compose/graph_manager.go:219" />) to keep cascading downstream, rippling the "skip" across the entire unchosen subgraph. So "wait for all predecessors" and "branching" can coexist: an unchosen predecessor doesn't "wait forever," it "explicitly skips."
+
+<Callout kind="warning" title="Why DAG must be acyclic">
+DAG's `get` requires all control predecessors to leave the `Waiting` state before firing. If the graph has a cycle, a node on the cycle has a predecessor stuck forever in `Waiting` (it's waiting on a node that hasn't run, which is waiting on it) — instant deadlock. So DAG mode runs a topological check at compile time via `validateDAG` (<SourceRef path="compose/graph.go:1077" />), returning `DAGInvalidLoopErr` (<SourceRef path="compose/graph.go:1129" />, message "DAG is invalid, has loop") if it finds a cycle. **Note: forbidding cycles isn't the channel refusing — it's the compile-time validator catching it early**; the channel would merely deadlock silently on a cycle.
+</Callout>
+
+## Who picks the mode
+
+The last piece: how does the engine know which channel to use? The answer is in compile-time `graph.compile` (<SourceRef path="compose/graph.go:679" />):
+
+```go
+// get run type
+runType := runTypePregel          // default Pregel
+cb := pregelChannelBuilder
+// ...
+if (opt != nil && opt.nodeTriggerMode == AllPredecessor) || isWorkflow(g.cmp) {
+    runType = runTypeDAG          // explicit AllPredecessor, or it's a Workflow
+    cb = dagChannelBuilder
+}
+```
+
+**The default is Pregel**; only when you explicitly specify the `AllPredecessor` trigger mode, or you're building a `Workflow` (next chapter), does it switch to DAG. The chosen `cb` (channel builder) is then used in `initChannelManager` (<SourceRef path="compose/graph_run.go:948" />) to construct a channel per node — the same construction code, just fed a different builder. That's the cleanest landing of "one loop, two channels": mode selection only affects "which builder," and the loop itself doesn't change one character.
+
+<Callout kind="tip" title="Try it">
+Open <SourceRef path="compose/pregel.go:55" /> and <SourceRef path="compose/dag.go:128" /> and read the two `get` methods side by side. Summarize their difference in one sentence, then recall Chapter 14's ReAct graph — why must it run in Pregel mode? (Hint: that back edge.) Then ask: if you were building a "fetch from multiple sources in parallel, aggregate once all arrive" flow, which mode would you pick?
+</Callout>
+
+## Chapter summary
+
+- compose has **one** super-step loop, `runner.run` (<SourceRef path="compose/graph_run.go:241" />): each round "submit → wait → compute next," barely looking at the mode.
+- Semantic switching rests on a swappable `channel` strategy (<SourceRef path="compose/graph_manager.go:29" />); its core is `get` — deciding whether each node is ready this round.
+- **Pregel** (<SourceRef path="compose/pregel.go:25" />): fire when any upstream arrives (`AnyPredecessor`), no accounting, **tolerates cycles** — ReAct's back edge relies on it.
+- **DAG** (<SourceRef path="compose/dag.go:50" />): fire only when all predecessors are settled (`AllPredecessor`), using **skip propagation** (<SourceRef path="compose/dag.go:106" />) to handle unchosen branches; **forbids cycles** via the compile-time `validateDAG` (<SourceRef path="compose/graph.go:1077" />), not the channel itself.
+- The mode is chosen at compile time (<SourceRef path="compose/graph.go:679" />): default Pregel, switch to DAG for `AllPredecessor` or `Workflow`; only the builder changes, the loop stays.
+- The design key: **decouple execution scheduling from readiness judgment**, demoting "cyclic vs acyclic" to a single strategy swap.
+
+Next chapter we go up a floor: how `Graph`, `Chain`, and `Workflow` — the three user-facing builders — layer different expressiveness on the same underlying graph, and how compile-time type checking catches a mis-wired edge on the spot.

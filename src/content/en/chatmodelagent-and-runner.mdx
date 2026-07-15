@@ -1,0 +1,151 @@
+## The smallest agent that runs
+
+`ChatModelAgent` is the most common agent type in the ADK: give it a model and an instruction and it can hold a conversation; give it tools and it automatically enters a "think — call a tool — think again" ReAct loop (dissected in Chapter 14). Let's start with the minimal form — model and instruction, no tools:
+
+```go
+agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+    Name:        "assistant",
+    Description: "A general-purpose assistant",
+    Instruction: "You are a helpful assistant.",
+    Model:       chatModel, // from eino-ext, e.g. openai.NewChatModel(...)
+})
+if err != nil {
+    return err
+}
+
+runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: agent})
+iter := runner.Query(ctx, "Explain event sourcing in one sentence.")
+for {
+    event, ok := iter.Next()
+    if !ok {
+        break
+    }
+    msg, _, err := adk.GetMessage(event)
+    if err != nil || msg == nil {
+        continue
+    }
+    fmt.Print(msg.Content)
+}
+```
+
+That's the whole thing. Now let's map each key point back to the source.
+
+<Mermaid title="One Runner.Query call, from query to event stream" chart={`
+sequenceDiagram
+  participant U as Caller
+  participant R as Runner
+  participant A as ChatModelAgent
+  participant M as ChatModel
+  U->>R: Query(ctx, "question")
+  R->>A: Run(ctx, input)
+  A->>M: Generate / Stream(messages)
+  M-->>A: message (may carry ToolCalls)
+  A-->>R: AsyncIterator[*AgentEvent]
+  loop iter.Next()
+    R-->>U: event (Output / Action / Err)
+  end
+`} />
+
+
+## Config: everything an agent is
+
+`ChatModelAgentConfig` (<SourceRef path="adk/chatmodel.go:260" />) is an alias for `TypedChatModelAgentConfig[*schema.Message]`. Its fields define everything the agent can do; memorize the core few first:
+
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `Name` | `string` | The agent's name; appears in each event's `AgentName` |
+| `Description` | `string` | Description; when used as a tool/sub-agent, this *is* its "tool spec" |
+| `Instruction` | `string` | System prompt; supports `{placeholder}` injection of session values (Ch.4) |
+| `Model` | `model.BaseModel[M]` | The model; **to use tools it must support `model.WithTools`** |
+| `ToolsConfig` | `ToolsConfig` | Tool configuration (Ch.3) |
+| `MaxIterations` | `int` | ReAct loop cap, defaults to 20 (<SourceRef path="adk/chatmodel.go:308" />) |
+| `Exit` | `tool.BaseTool` | Optional exit tool; when nil, no Exit action is generated |
+| `OutputKey` | `string` | Key under which the final output is written back to the session |
+
+<Callout kind="note" title="Description is not a human-only comment">
+`Description` looks like a docstring, but in multi-agent scenarios it has a real function: when this agent is wrapped as a tool via `NewAgentTool` (Chapters 7 and 16), `Description` is exactly the "what can this tool do" text the model sees. Write it vaguely and the calling model won't know whether to invoke it.
+</Callout>
+
+The constructor `NewChatModelAgent` (<SourceRef path="adk/chatmodel.go:484" />) does basic validation: a nil `Model` is an immediate error, and a nil `GenModelInput` gets filled with the default implementation (which assembles `Instruction` + history into the model input — detailed in Chapter 4).
+
+## Run vs Query: two entry points
+
+The `Runner` has two ways to run, differing only in input shape.
+
+`Query` (<SourceRef path="adk/runner.go:108" />) takes a string and wraps it into one user message internally:
+
+```go
+func (r *TypedRunner[M]) Query(ctx context.Context, query string,
+    opts ...AgentRunOption) *AsyncIterator[*TypedAgentEvent[M]] {
+    msgs, err := newUserMessage[M](query)
+    if err != nil {
+        return errorIterator[M](err)
+    }
+    return r.Run(ctx, []M{msgs}, opts...)
+}
+```
+
+`Run` (<SourceRef path="adk/runner.go:102" />) takes a message slice `[]M`, which fits when you already have multi-turn history, or want to inject system/assistant messages:
+
+```go
+iter := runner.Run(ctx, []*schema.Message{
+    schema.SystemMessage("Answer only in JSON."),
+    schema.UserMessage("List three consistency models."),
+})
+```
+
+Both return the same `*AsyncIterator[*TypedAgentEvent[M]]`. Remember: **`Query` is just single-string sugar over `Run`**, with no behavioral difference.
+
+## Consuming the event stream: the Next loop and GetMessage
+
+Consuming the stream is always the same pattern — a `Next()` loop until `ok == false`:
+
+```go
+for {
+    event, ok := iter.Next()
+    if !ok {
+        break
+    }
+    // ...
+}
+```
+
+`AsyncIterator` is backed by an unbounded channel (<SourceRef path="adk/utils.go:31" />); `Next()` receives events from it, and the second return value tells you whether the stream is exhausted (<SourceRef path="adk/utils.go:35" />).
+
+But an event's output may be **streaming** (`Output.MessageOutput.IsStreaming == true`), in which case the `Message` field is empty and the content lives in a `MessageStream`. Handling both cases by hand is tedious, so the ADK gives you `GetMessage` (<SourceRef path="adk/utils.go:300" />):
+
+```go
+msg, newEvent, err := adk.GetMessage(event)
+```
+
+It does the following: for non-streaming, it returns `Message` directly; for streaming, it **copies the stream** (`Copy(2)`), concatenates it into a complete message, and replaces the stream in the original event with a fresh consumable copy (which is why it returns a `newEvent`). You get the full text without "consuming a stream someone else still needs."
+
+<Callout kind="key" title="The design key for this chapter">
+A "stream" is a first-class citizen in Eino, but streams have a built-in trap: **a stream can be read only once.** The ADK's approach is that anywhere it needs to *peek* at stream content, it copies first, reads, then swaps in a fresh, unconsumed stream at the original spot. `GetMessage` is the façade over that principle. You'll see the underlying `StreamReader` copy-on-read implementation in Chapter 21.
+</Callout>
+
+## What EnableStreaming actually toggles
+
+Beginners often think `EnableStreaming` is a UI switch for "typewriter effect." It's lower-level than that: it decides whether ChatModelAgent calls `Stream` or `Invoke` on the compiled graph internally (<SourceRef path="adk/chatmodel.go:1202" />):
+
+```go
+if mp.input.EnableStreaming {
+    msgStream, err_ = runnable.Stream(ctx, in, runOpts...)
+} else {
+    msg, err_ = runnable.Invoke(ctx, in, runOpts...)
+}
+```
+
+It's a field on `RunnerConfig` (<SourceRef path="adk/runner.go:68" />), and the Runner stamps it into every `AgentInput`. Turn it on and an event's `Output` is streaming, so you use `GetMessage` or read `MessageStream` manually; turn it off and `Message` is the complete message directly.
+
+One easily-missed detail: **on Resume, the streaming mode comes from the checkpoint, not the caller** (<SourceRef path="adk/runner.go:124" />). If you interrupted in streaming mode, you resume in streaming mode — the state remembers. That's one concrete expression of "interrupt/resume must faithfully restore the original context," which Chapter 5 tackles head-on.
+
+## Chapter summary
+
+- `ChatModelAgent` is the workhorse agent: model + instruction to converse, add tools to enter the ReAct loop.
+- In `Config`, `Name` / `Description` / `Instruction` / `Model` are the four must-know fields; `Description` doubles as the "tool spec" in multi-agent setups.
+- `Query` is single-string sugar over `Run`; both return the same event stream.
+- Always consume events with `for { Next() }`; use `GetMessage` to handle streaming vs non-streaming output safely.
+- `EnableStreaming` decides `Stream` vs `Invoke` internally; on resume, streaming mode is dictated by the checkpoint.
+
+Next, we'll give this agent tools, nail down the `ToolInfo` / `InvokableTool` contract, and see why tool binding is immutable.

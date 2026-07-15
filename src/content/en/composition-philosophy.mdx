@@ -1,0 +1,58 @@
+## One engineering decision, two worldviews
+
+When one agent needs to hand part of its work to another agent, Eino offers two routes. They look like a mere API difference, but they encode two worldviews about *who owns the control flow*. This is the climax of the whole tutorial — Eino's answer here shapes almost all of its higher-level design.
+
+Build intuition with the demo first, then we open the source.
+
+<Viz name="agent-tool-vs-transfer" />
+
+## Route one: Transfer — control jumps
+
+Transfer's mental model is a baton pass: the parent decides to stop handling things itself and *jumps* control to the sub-agent. Both share one session — the same message history, the same state.
+
+That brings a tempting upside: the sub-agent sees full context with no re-passing of arguments. But the cost hides in the control flow.
+
+<Callout kind="warning" title="Why the official NOT RECOMMENDED">
+In the comments at <SourceRef path="adk/interface.go:330" />, transfer is explicitly marked **NOT RECOMMENDED**. Not because it "can't work", but because it lets the sub-agent's control-flow events (`Exit`, `Transfer`, interrupts) all act on the shared control flow. The parent can neither isolate the child's side effects nor cleanly recover its own state after the child interrupts.
+</Callout>
+
+## Route two: Agent-as-Tool — compose, don't jump
+
+The second route wraps the sub-agent as an ordinary **tool**. The parent sees no "other agent", only "a tool to call". This is what prebuilt patterns like `DeepAgent` use; the implementation lives in <SourceRef path="adk/agent_tool.go" />.
+
+Two differences matter:
+
+1. **Isolated session.** The sub-agent runs in its own conversation; parent and child histories never contaminate each other. The parent gets only the tool's return value.
+2. **Control flow is absorbed at the boundary.** The sub-agent's `Exit` / `Transfer` / `BreakLoop` are "swallowed" at the tool boundary — interpreted only as "this tool call finished", never leaking out to affect the parent.
+
+<Callout kind="key" title="The design key of this chapter">
+`agent-as-tool` reduces "a sub-agent's control flow" to "a tool call's return". Control flow is sealed behind a boundary, so agents become **composable** again — you can nest one agent inside another like building blocks, without fearing that an inner `Exit` flips the whole table.
+</Callout>
+
+## The one exception: interrupts must pass through
+
+If every control-flow event were swallowed, human-in-the-loop would break — an inner "await approval" interrupt swallowed at the boundary means the parent never learns it should pause and persist state.
+
+So Eino makes a precise exception: **`Interrupted` passes through and bubbles up**, composed layer by layer via `CompositeInterrupt` (see <SourceRef path="adk/interface.go:346" />), so the parent's checkpoint can cover the *entire call tree*.
+
+| Dimension | Transfer (shared session) | Agent-as-Tool (isolated) |
+| --- | --- | --- |
+| Context visibility | Fully exposed | Returned on demand |
+| `Exit` / `Transfer` | Affect shared control flow | Absorbed at boundary |
+| Interrupt / resume | Hard to isolate & recover | `Interrupted` passes, composable checkpoint |
+| Composability | Weak | Strong |
+| Official guidance | NOT RECOMMENDED | Recommended |
+
+## Connecting the philosophy
+
+Many of Eino's designs look like "just one API choice" in isolation; only when you connect them do they reveal one consistent philosophy:
+
+- **An agent is an event-stream generator** (Ch8) — so a sub-agent's output can naturally be consumed as a tool's return value.
+- **Composition over jumping** (this chapter) — so isolation boundaries become the default.
+- **Interrupts are first-class** (Ch23) — so the boundary must leave a gap open for `Interrupted`.
+
+Understanding this chapter gives you the key to reading all of the ADK source: whenever you see a *boundary*, ask — **what does it swallow, and what does it let through?**
+
+<Callout kind="tip" title="Try it">
+Open <SourceRef path="adk/agent_tool.go" /> and find where `typedAgentTool` adapts `tool.BaseTool`. Following steps 6 and 7 demonstrated in this chapter, see how it distinguishes "swallow Exit" from "let Interrupted through." Chapter 16 dissects this implementation line by line.
+</Callout>

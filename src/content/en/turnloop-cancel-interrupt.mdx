@@ -1,0 +1,112 @@
+## From "pull" to "push"
+
+Chapter 14 showed you that ReAct is a compiled graph; Chapter 13 showed you how `flowAgent` drives it. But one question remains: when a run needs to **live for a long time** — say a conversation session you can append input to at any moment, halt at any moment, interrupt and resume at any moment — who plays the "master scheduler"?
+
+The answer is `TurnLoop`. If `flowAgent.run` is the skeleton of "one run," `TurnLoop` is the skeleton of a "multi-turn conversation." It wrings all the earlier machinery — event streams, cancel, interrupt, checkpoint — into one long-lived loop. This chapter pries apart three things: the push-based event loop, the cancel safe-point state machine, and the **two-layer checkpoint bridge** connecting the ADK to the compose engine beneath.
+
+<Viz name="checkpoint-resume" />
+
+Keep the two flows in the diagram above in mind, we'll use them repeatedly: **horizontal** is control flow advancing across nodes, **vertical** is the same state serialized into a checkpoint and restored. All of `TurnLoop`'s complexity is about managing where those two flows meet.
+
+## TurnLoop: a push-based event loop
+
+`TurnLoop[T, M]` (<SourceRef path="adk/turn_loop.go:896" />) is a doubly-generic struct: `T` is the type of item you push to it, `M` is the message type. To the outside it exposes just four verbs:
+
+```go
+func (l *TurnLoop[T, M]) Run(ctx context.Context)                       // start the loop
+func (l *TurnLoop[T, M]) Push(item T, opts ...PushOption[T, M]) (bool, <-chan struct{}) // push one item
+func (l *TurnLoop[T, M]) Stop(opts ...StopOption)                       // request stop
+func (l *TurnLoop[T, M]) Wait() *TurnLoopExitState[T, M]                // wait for exit
+```
+
+`Run` (<SourceRef path="adk/turn_loop.go:1350" />) starts exactly once (guarded by `runOnce sync.Once`); the real loop body lives in the private `run` (<SourceRef path="adk/turn_loop.go:1570" />). `Push` (<SourceRef path="adk/turn_loop.go:1381" />) stuffs new input into an internal buffer and returns a channel so you can wait for that item to be processed; `Stop` (<SourceRef path="adk/turn_loop.go:1524" />) requests a graceful exit; `Wait` (<SourceRef path="adk/turn_loop.go:1565" />) blocks until the `done` channel closes.
+
+<Callout kind="note" title='Why "push," not "pull"'>
+In Part I you actively "pulled" events with `iter.Next()`, which suits a single question-and-answer. But a long-lived conversation needs **external input pushable at any time** and **events produced continuously from inside** — the classic producer/consumer. So `TurnLoop` builds in a pair of async pipes: `AsyncIterator` (consumer side, `Next`) and `AsyncGenerator` (producer side, `Send`), created together by `NewAsyncIteratorPair` (<SourceRef path="adk/utils.go:57" />) over an unbounded channel underneath (<SourceRef path="adk/utils.go:31" />). The push loop fully decouples "append input" from "consume events."
+</Callout>
+
+Each time the loop processes an item, it calls `runAgentAndHandleEvents` (<SourceRef path="adk/turn_loop.go:1809" />) to run one round of the agent. There's a subtle design here: it doesn't hand the agent's event stream straight to the outer layer. It first builds a `bridgeStore` (<SourceRef path="adk/turn_loop.go:1820" />), uses it to construct an inner `TypedRunner` (<SourceRef path="adk/turn_loop.go:1836" />), then opens a fresh pair of proxy pipes (<SourceRef path="adk/turn_loop.go:1877" />) and forwards inner events one by one to the outer layer via a goroutine that `Send`s them (<SourceRef path="adk/turn_loop.go:1896" />). Why the extra layer? The next section's checkpoint bridge reveals it.
+
+## Cancel: a safe-point state machine
+
+Chapter 14 said cancel isn't `kill` but "run to a safe point, then stop cleanly." Here we see the implementation. At the core is `CancelMode` (<SourceRef path="adk/cancel.go:43" />), enumerating three "where to stop" strategies:
+
+```go
+const (
+    CancelImmediate      CancelMode = 0        // cancel the moment the signal arrives, no safe-point wait
+    CancelAfterChatModel CancelMode = 1 << iota // wait for the current ChatModel call to finish
+    CancelAfterToolCalls                         // wait for the current round of tool calls to finish
+)
+```
+
+These three map to the two `SafePoint` kinds in the graph (<SourceRef path="adk/turn_loop.go:1056" />): `AfterChatModel` and `AfterToolCalls`, plus the "either one" `AnySafePoint`. You obtain a cancel function via `WithCancel()` (<SourceRef path="adk/cancel.go:217" />); calling it fires `triggerCancel` (<SourceRef path="adk/cancel.go:423" />).
+
+What actually decides "should we stop now" is an atomic state machine, `cancelContext` (<SourceRef path="adk/cancel.go:301" />). Its `mode` field is read and written atomically; `shouldCancel()` (<SourceRef path="adk/cancel.go:466" />) and `isImmediateCancelled()` (<SourceRef path="adk/cancel.go:482" />) are queried at each safe point to decide whether to continue or wind down.
+
+<Callout kind="key" title="The design key for this chapter">
+Cancel is implemented as a **safe-point state machine**, not a hard interrupt. The deeper reason: **cancel and interrupt share one chassis**. Look at the wrapper `wrapIterWithCancelCtx` (<SourceRef path="adk/cancel.go:806" />) — it intercepts the event stream, and when it sees the root agent raise an "internal interrupt signal" at a safe point *and* it's genuinely time to cancel, it **translates that interrupt right there into a `CancelError`** and sends it out (<SourceRef path="adk/cancel.go:820" />). In other words: **cancel = actively trigger an interrupt at a safe point, then read the interrupt result as "cancelled."** Chapter 14's line "cancel naturally shares the interrupt/resume mechanism" lands concretely here — the same safe point is both the interrupt's landing spot and the cancel's.
+</Callout>
+
+## The interrupt family and serialization
+
+The "interrupt" that cancel reuses is itself a layered family. The most basic is `Interrupt` (<SourceRef path="adk/interrupt.go:88" />), producing an event with an interrupt action; `StatefulInterrupt` (<SourceRef path="adk/interrupt.go:123" />) additionally carries a resumable state; the generic form is `TypedInterrupt` (<SourceRef path="adk/interrupt.go:59" />).
+
+What actually lets "an isolated sub-agent bubble an interrupt to the top" is `CompositeInterrupt` (<SourceRef path="adk/interrupt.go:156" />) and its generic `TypedCompositeInterrupt` (<SourceRef path="adk/interrupt.go:129" />) — it can **aggregate** several child interrupt signals (`InterruptSignal`) into one composite interrupt. Chapter 16's AgentTool piercing the tool boundary uses exactly this.
+
+Everything "resume" needs is packed into a `gob`-serializable struct, `serialization` (<SourceRef path="adk/interrupt.go:210" />):
+
+```go
+type serialization struct {
+    RunCtx              *runContext             // the whole run environment (Chapter 13)
+    Info                *InterruptInfo          // backward compatibility
+    EnableStreaming     bool
+    InterruptID2Address map[string]Address      // interrupt id -> node address
+    InterruptID2State   map[string]core.InterruptState // interrupt id -> state
+}
+```
+
+Compare `ResumeInfo` (<SourceRef path="adk/interrupt.go:33" />): on resume you read this struct out, find "which node it paused at" via `InterruptID2Address`, and restore "the local state at that moment" via `InterruptID2State`. This is the data body of the visualization's **vertical flow**.
+
+## Two-layer checkpoint: the bridgeStore
+
+Now the suspense from earlier: why does `TurnLoop` wrap a `bridgeStore` (<SourceRef path="adk/interrupt.go:325" />) in the middle?
+
+Because the ADK's interrupt has **two layers**. The compose graph engine underneath (Chapter 23) has its own checkpoint mechanism — when the ReAct graph interrupts at some node, the compose engine is the one that first writes the graph's state into a store. But the ADK layer wants to wrap another round of session-level state around that. Two layers each writing their own; who stitches them together?
+
+The answer is `bridgeStore` — an in-memory `CheckPointStore` (`Get`/`Set` around <SourceRef path="adk/interrupt.go:330" />) that agrees on a fixed bridging key:
+
+```go
+const bridgeCheckpointID = "adk_react_mock_key"
+```
+
+The flow goes like this: when the inner compose/runner interrupts, it writes the graph's checkpoint bytes into `bridgeStore`'s `bridgeCheckpointID` slot; `TurnLoop` then **pulls those bytes back** via `finalizeCheckpoint` (<SourceRef path="adk/turn_loop.go:1921" />) and stitches them into its own session-level checkpoint:
+
+```go
+finalizeCheckpoint := func() error {
+    if store != nil && ms != nil {
+        data, ok, err := ms.Get(ctx, bridgeCheckpointID) // fetch the inner checkpoint from bridgeStore
+        // ...
+        if ok {
+            l.checkPointRunnerBytes = append([]byte{}, data...) // stitch into TurnLoop's state
+        }
+    }
+    return nil
+}
+```
+
+Resume goes the other way: `newResumeBridgeStore` (<SourceRef path="adk/interrupt.go:319" />) puts the previously saved bytes back into the bridge's slot, and the inner engine reads the graph state from there. `newBridgeStore` (<SourceRef path="adk/interrupt.go:315" />) is for a fresh round.
+
+<Callout kind="note" title='Why "bridge" instead of "merge"'>
+Both layers use the same underlying mechanism (both are the `CheckPointStore` interface), but their semantic boundaries differ: the compose layer manages "which node a graph paused at," the ADK layer manages "which turn the whole session paused at, and what external input is still pending." `bridgeStore` uses one fixed key as the handoff, letting the two layers evolve independently while guaranteeing a seamless join on resume. This is the real cross-layer implementation of the visualization's vertical "persist -> restore" flow — one state, written cooperatively by two layers.
+</Callout>
+
+## Chapter summary
+
+- `TurnLoop` (<SourceRef path="adk/turn_loop.go:896" />) is the skeleton of a **multi-turn conversation**: four verbs `Run`/`Push`/`Stop`/`Wait`, with a push-based producer/consumer loop inside.
+- The push pipe is a pair of `AsyncIterator`/`AsyncGenerator` (<SourceRef path="adk/utils.go:57" />), decoupling "append input" from "consume events."
+- Cancel is a **safe-point state machine**: `CancelMode`'s three strategies (<SourceRef path="adk/cancel.go:43" />) map to `SafePoint` (<SourceRef path="adk/turn_loop.go:1056" />), decided atomically by `cancelContext` (<SourceRef path="adk/cancel.go:301" />).
+- The key unification: `wrapIterWithCancelCtx` (<SourceRef path="adk/cancel.go:806" />) **translates an interrupt signal into a `CancelError`** at a safe point — cancel and interrupt share one chassis.
+- The interrupt family: `Interrupt`/`StatefulInterrupt`/`CompositeInterrupt` (<SourceRef path="adk/interrupt.go:156" />), with resume state packed into `serialization` (<SourceRef path="adk/interrupt.go:210" />).
+- **Two-layer checkpoint** is bridged by `bridgeStore` (<SourceRef path="adk/interrupt.go:325" />) plus the fixed key `bridgeCheckpointID`: the inner compose layer writes, `TurnLoop.finalizeCheckpoint` (<SourceRef path="adk/turn_loop.go:1921" />) pulls it back and stitches.
+
+Next chapter we see how this "interrupt can pierce the boundary" ability powers an elegant abstraction: the AgentTool — making a full agent masquerade as an ordinary tool while keeping control flow firmly isolated.

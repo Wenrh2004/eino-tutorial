@@ -1,0 +1,52 @@
+## 让程序「按下暂停键」
+
+想象一个 Agent 正要执行「转账 10000 元」这个工具,但你的业务要求:**必须先经人工审批**。审批可能几秒完成,也可能隔一天才有人处理。这段时间里,你总不能让一个进程干等着。
+
+理想的做法是:程序运行到这里,把当前所有状态**存到磁盘**,然后干净退出;等审批结果回来,再从**断点**继续,仿佛从未停过。这就是中断 / Checkpoint / 续跑。在 Eino 里,这套机制不是打补丁打上去的,而是编排引擎的**一等公民**。
+
+<Viz name="checkpoint-resume" />
+
+## 中断不是错误,是一次合法暂停
+
+第一个认知转变:`Interrupt` 不是 `error`。当某个节点(比如需要人工审批的工具)抛出 `Interrupt` / `StatefulInterrupt`(见 <SourceRef path="compose/interrupt.go" />),引擎不会把它当异常处理,而是理解为「这轮运行需要在此**合法地暂停**」。
+
+Eino 提供了一个中断家族:
+
+- **`Interrupt`**:最基础的暂停信号。
+- **`StatefulInterrupt`**:暂停时还携带一份自定义状态(比如「等待审批的这笔转账详情」)。
+- **`CompositeInterrupt`**:把来自调用树深处的多个中断**组合**起来向上冒泡——这正是第 9 章说的「`Interrupted` 穿透工具边界」在底层的实现。
+
+## Checkpoint:把整轮状态序列化
+
+节点一旦中断,引擎就把**整轮运行状态**打包存盘(见 <SourceRef path="compose/checkpoint.go" />)。这份 Checkpoint 包含两样东西:
+
+1. **所有 channel 的当前值**——即节点之间正在传递的数据。
+2. **各节点的 state**——每个有状态节点自己维护的数据。
+
+序列化用的是 Go 的 `gob`。这带来一个务实的约束:**凡是要跨中断存活的类型,都必须能被 gob 编码**。这也是为什么第 8 章强调 ADK 的消息类型设计得如此克制——它们都得能安全地穿过一次序列化往返。
+
+<Callout kind="note" title="Address:断点的坐标">
+光存下状态还不够,还得知道「从哪里恢复」。Checkpoint 里的 **`Address`** 就是断点的坐标——它精确定位到是**哪个节点**、在调用树的**哪一层**中断了。续跑时,引擎靠 `Address` 找回那个节点,把恢复数据注入进去。嵌套的 Agent 调用之所以能层层续跑,靠的就是 `Address` 的层级定位。
+</Callout>
+
+## Resume:从断点无缝续跑
+
+状态落盘后,进程可以安全退出。等外部条件满足(审批通过了),你调用 Resume 家族的 API 让它继续(见 <SourceRef path="compose/resume.go" />):
+
+- **`Resume(id)`**:按 checkpoint id 恢复,不注入新数据。
+- **`ResumeWithData(id, data)`**:恢复的同时,把 `data`(比如「审批通过 + 审批人备注」)注入到当初中断的那个节点。
+- **`BatchResumeWithData(...)`**:一次性恢复**多个**中断点——这对「一个计划里有好几个待审批步骤」的场景至关重要。
+
+引擎按 `Address` 反序列化还原运行状态,把 resume 数据喂给中断节点,图就从断点继续跑,后续节点完全感知不到中间发生过一次「暂停 + 换进程 + 恢复」。
+
+<Callout kind="key" title="本章的设计钥匙">
+因为取消和中断都发生在**节点边界**(第 14 章),而节点边界的状态是可 `gob` 序列化的,所以「暂停程序」被降维成了「序列化一次运行状态」。中断 / Checkpoint / 续跑,本质是**把一次运行的『暂停点』变成一个可存储、可寻址、可恢复的数据结构**。
+</Callout>
+
+## 这就是 ADK 人在回路的地基
+
+回看第 5 章你「会用」的那套 HITL——工具触发中断、存 checkpoint、Resume 续跑——现在你看到了它的地基。ADK 没有为 HITL 发明任何新机制,它只是**继承**了编排引擎这套一等公民的中断能力,再在 Agent 语义上包了一层好用的外壳。上层的「人在回路」之所以可靠,是因为下层的「暂停即数据」足够扎实。
+
+<Callout kind="tip" title="动手">
+打开 <SourceRef path="compose/checkpoint.go" /> 和 <SourceRef path="compose/resume.go" />,找到 checkpoint 的序列化结构和 `Resume` 的入口。对照上面演示的 persist(第 3 步)和 resume(第 5 步),确认:存的时候写入了哪些字段?恢复的时候,resume 数据是从哪一步注入回节点的?
+</Callout>

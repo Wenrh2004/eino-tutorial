@@ -1,0 +1,137 @@
+## 两块压轴基石:流与状态
+
+Part IV 走到这里,执行内核(循环 + channel)和三个构建器(Graph/Chain/Workflow)都拆完了。但还有两块基石没碰,而它们恰恰是 ADK 里"流式回复"和"跨轮记忆"的底层支撑:**stream(流)** 和 **state(状态)**。这一章我们把它们一起讲清楚——因为它们体现了同一种设计取向:**用最省的机制,兑现最强的语义。**
+
+<Mermaid title="StreamReader:五种来源,对外同一个类型" chart={`
+flowchart TB
+  subgraph SRC["五种来源"]
+    ST["stream · Pipe 管道"]
+    AR["arrayReader · 数组伪装"]
+    MSR["multiStreamReader · 合并"]
+    SRW["…WithConvert · 类型转换"]
+    CSR["childStreamReader · Copy 子流"]
+  end
+  SRC --> SR["StreamReader[T]<br/>tagged union · 按 typ 分派"]
+  SR --> RECV["Recv() 读一次即干涸<br/>close 恰好一次"]
+`} />
+
+
+## 流不是数据,是"一次性的取水管"
+
+先纠正一个直觉。Eino 的 `StreamReader[T]`(<SourceRef path="schema/stream.go:168" />)不是一个装着数据的切片,而是一根**读一次就干涸**的管子。文档写得很直白:read-once,只能一个 goroutine 调 `Recv`,而且必须 close 恰好一次。
+
+它的入口是 `Pipe`(<SourceRef path="schema/stream.go:99" />),给你一对 reader/writer;writer 那头 `Send`,reader 这头 `Recv` 到 `io.EOF` 为止。但真正精妙的是 `StreamReader` 的内部结构——它是一个**带标签的联合类型**(tagged union):
+
+```go
+type StreamReader[T any] struct {
+    typ readerType          // 我到底是哪一种 reader?
+
+    st  *stream[T]              // 真·管道(Pipe 来的)
+    ar  *arrayReader[T]         // 数组伪装成的流
+    msr *multiStreamReader[T]   // 合并出来的多路流
+    srw *streamReaderWithConvert[T] // 带类型转换的流
+    csr *childStreamReader[T]   // Copy 出来的子流
+}
+```
+
+`Recv` 就是一个按 `typ` 分发的 switch。为什么要这么设计?因为 Eino 里"流"有五种来源(管道、数组、合并、转换、复制),但对使用者必须是**同一个类型**。用一个 union + 一个 tag,既避免了接口装箱的开销,又让五种流对外完全一致。这是整章的第一个设计信号:**统一对外类型,内部按需分派。**
+
+## Copy:读时复制的单链表
+
+流是读一次就没的,那"一个大模型的输出,既要给用户看、又要喂给下一个节点"怎么办?答案是 `Copy(n)`(<SourceRef path="schema/stream.go:261" />)。
+
+难点在于:上游流有多长你事先不知道,而 n 个消费者各读各的、进度不一。Eino 的解法非常漂亮——一个**读时复制(copy-on-read)的单向链表**。核心类型是 `cpStreamElement`(<SourceRef path="schema/stream.go:784" />):
+
+```go
+type cpStreamElement[T any] struct {
+    once sync.Once            // 保证这一格只从源头读一次
+    next *cpStreamElement[T]  // 指向下一格(读到才创建)
+    item streamItem[T]        // 缓存下来的那一块数据
+}
+```
+
+`Copy` 造出一个 `parentStreamReader`(<SourceRef path="schema/stream.go:823" />)和 n 个 `childStreamReader`(<SourceRef path="schema/stream.go:883" />)。每个 child 记着自己走到链表的哪一格。当某个 child 要 `Recv`,它落到 `peek`(<SourceRef path="schema/stream.go:837" />),核心就一段:
+
+```go
+elem.once.Do(func() {
+    t, err = p.sr.Recv()          // 只有第一个到这格的 child 真的去源头读
+    elem.item = streamItem[T]{chunk: t, err: err}
+    if err != io.EOF {
+        elem.next = &cpStreamElement[T]{}  // 顺手把下一格铺好
+        p.subStreamList[idx] = elem.next
+    }
+})
+// 后到的 child 直接读缓存好的 elem.item,不碰源头
+```
+
+`sync.Once` 是这里的灵魂:**同一格,无论多少个 child 经过,只有第一个真去源头 `Recv` 一次,其余的读缓存。**跑得快的 child 沿着链表往前铺路,跑得慢的沿着同一条链追,谁都不会重复消费源头,也不用等齐。等所有 child 都 close,源头才被 close(`close` 里用 `closedNum` 计数,<SourceRef path="schema/stream.go:868" />)。
+
+<Callout kind="key" title="本章的设计钥匙">
+流与状态,共享同一条设计哲学:**用最小的机制承载最强的语义,并把成本推迟到真正需要的那一刻。** 流的 `Copy` 不预读、不缓冲整条流,而是用 `sync.Once` 守护的单链表做**惰性的读时复制**——快的消费者铺路、慢的追赶,源头每格只读一次;合并用 select **按到达顺序**交织而非轮询,顺其自然。状态则不做全局字典,而是把每层图的 state 串成一条 `parent` 链,`ProcessState[S]` 靠**类型断言逐级上溯**去找匹配 `S` 的那一层。两者都拒绝"预先算好、集中保管",都选择"用时才求值、按需才分派"——这正是支撑 ADK 流式与记忆而不拖垮性能的关键。
+</Callout>
+
+## Merge:按到达顺序交织
+
+`Copy` 是一变多,`Merge` 是多变一。`MergeStreamReaders`(<SourceRef path="schema/stream.go:912" />)把 N 路流合成一路。注意它的语义:**按到达顺序交织(arrival order),不是轮询,也不保证顺序**——哪路先来数据就先吐哪路。只有所有源都 EOF,合并流才 EOF。
+
+实现上是 `multiStreamReader`,它的 `recv`(<SourceRef path="schema/stream.go:538" />)分两条路:源少时(≤5)走一组硬编码的 `select`(<SourceRef path="schema/select.go:21" />),源多时(>5)才动用 `reflect.Select`。这个 5 的阈值就是 `maxSelectNum`(<SourceRef path="schema/select.go:19" />):
+
+```go
+const maxSelectNum = 5
+```
+
+为什么要分两条路?`reflect.Select` 灵活但慢;而绝大多数合并场景源都不多,于是 Eino 为 2~5 路手写了展开的 `select`,把反射开销省掉。这又是一次"常见路径手工优化、罕见路径才降级到反射"的取舍——和上一章类型检查里"编译期能拦就编译期拦"如出一辙。
+
+还有一个变体 `MergeNamedStreamReaders`(<SourceRef path="schema/stream.go:990" />):当某一路 EOF 时,它吐一个 `SourceEOF` 告诉你**是哪一路结束了**,而不是默默咽下。多智能体里"等 A 说完再处理 B"就靠它。底层都汇进 `InternalMergeNamedStreamReaders`(<SourceRef path="schema/stream.go:1010" />)。
+
+## 装箱与拆箱:流与非流的边界
+
+节点有的吐流、有的吐单值,编排引擎怎么抹平这个差异?靠一对互逆操作。
+
+**装箱**:把一个已经算好的值伪装成流,用 `StreamReaderFromArray`(<SourceRef path="schema/stream.go:461" />)——它其实就是塞一个 `arrayReader`,`Recv` 时逐个吐出、最后 `io.EOF`。一个非流节点的输出,就这样被"装箱"成下游期待的流。
+
+**拆箱**:反过来,把一个流收敛成单值,用 `concatStreamReader`(<SourceRef path="compose/stream_concat.go:50" />)——它把流里所有 chunk 收齐,交给 `internal.ConcatItems`(<SourceRef path="internal/concat.go:91" />)按类型拼接(map 合并、slice 拼接、或用你注册的 concat 函数)。大模型流式吐出的一堆 `Message` 分片,就是这样被拼回一条完整消息的。
+
+**装箱/拆箱是 Eino 处理"流与非流混排"的统一手法**:引擎永远可以把任意节点的输出规整成下游想要的形态,使用者因此几乎感觉不到"这个节点到底是不是流式的"。
+
+## State:按类型逐级上溯的一条链
+
+最后是状态。ADK 的记忆、跨节点共享数据,底层都落在 compose 的 state 上。
+
+状态怎么存?图在运行时,如果注册了 `WithGenLocalState`(<SourceRef path="compose/generic_graph.go:37" />),就在 `runCtx` 里造一个 `internalState` 塞进 context(<SourceRef path="compose/graph.go:842" />)。关键在这个结构(<SourceRef path="compose/state.go:34" />)带一个 `parent` 指针:
+
+```go
+type internalState struct {
+    state  any
+    mu     sync.Mutex
+    parent *internalState   // 指向外层图的 state
+}
+```
+
+于是当图嵌套图(比如一个 ADK agent 内部又是一张图),state 就串成一条从内到外的链。你用 `ProcessState[S]`(<SourceRef path="compose/state.go:165" />)读状态时,它调 `getState[S]`(<SourceRef path="compose/state.go:175" />)沿着这条链**逐级做类型断言**:
+
+```go
+for interState != nil {
+    if cState, ok := interState.state.(S); ok {
+        return cState, &interState.mu, nil   // 找到类型匹配的那一层
+    }
+    interState = interState.parent            // 没匹配,上溯外层
+}
+```
+
+这个设计很有意思:**状态不是按名字找,而是按类型找。**你在内层图里 `ProcessState[*MyState]`,它会从最内层开始一路往外,找到第一个 state 类型正好是 `*MyState` 的那层图,返回它以及它那把独立的锁(每层一把 `mu`,<SourceRef path="compose/state.go:36" />)。这让"内层能读到外层共享的状态"变得自然,而无需任何全局注册表——类型本身就是寻址的钥匙。
+
+<Callout kind="tip" title="动手">
+做个实验感受 `Copy` 的惰性:`Pipe` 出一个流,`Copy(2)`,让其中一个 child 一口气读完,另一个隔一会儿再读。你会发现慢的那个仍能读到全部数据——因为快的那个把链表铺好了(<SourceRef path="schema/stream.go:837" />)。再把 `sync.Once` 的作用想一遍:如果去掉它,同一格会被两个 child 各读一次源头,数据就会错乱。
+</Callout>
+
+## 本章小结
+
+- **流是读一次的管子**,`StreamReader`(<SourceRef path="schema/stream.go:168" />)是带 tag 的联合类型,五种来源对外统一,`Recv` 按 tag 分派。
+- **Copy**(<SourceRef path="schema/stream.go:261" />)用 `sync.Once` 守护的读时复制单链表(<SourceRef path="schema/stream.go:784" />)做扇出:每格只从源头读一次,快者铺路慢者追赶,全 close 才关源。
+- **Merge**(<SourceRef path="schema/stream.go:912" />)按到达顺序交织;≤5 路走手写 `select`,>5 路才用 `reflect.Select`(阈值 `maxSelectNum=5`,<SourceRef path="schema/select.go:19" />)。
+- **装箱**(<SourceRef path="schema/stream.go:461" />)把值伪装成流,**拆箱**(<SourceRef path="compose/stream_concat.go:50" />→<SourceRef path="internal/concat.go:91" />)把流拼回值,抹平流与非流的边界。
+- **State**(<SourceRef path="compose/state.go:34" />)是一条带 `parent` 的链,`ProcessState[S]`(<SourceRef path="compose/state.go:165" />)按**类型**逐级上溯,每层各有一把锁——类型即寻址。
+- 设计钥匙:流与状态都奉行"最小机制、最强语义、成本后置"——这正是 ADK 流式与记忆的地基。
+
+至此 Part IV 收官:你已经看清 compose 从执行内核、三个构建器到流与状态的全貌。下一部分我们把镜头拉远,回到全局——把 ADK、compose、components 三层如何咬合成一个完整的框架,做一次总览与延展。

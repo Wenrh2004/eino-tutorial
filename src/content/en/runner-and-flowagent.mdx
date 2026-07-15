@@ -1,0 +1,170 @@
+## Opening the hood
+
+In Part I you learned to **use** the ADK; in Part II you understood **why** it's designed the way it is. Now Part III: when you write that single line `runner.Query(ctx, "...")`, what actually happens under the hood?
+
+The answer bends intuition a little. Every agent you met in Part I — `ChatModelAgent`, `supervisor`, `DeepAgent` — is quietly swapped for the **same internal type** at runtime: the `flowAgent`. And the `Runner` itself is so thin it barely qualifies as a "runtime." This chapter pries that skeleton apart.
+
+<Mermaid title="A thin Runner + the unified flowAgent skeleton" chart={`
+flowchart TB
+  subgraph USER["the agents you wrote"]
+    CMA["ChatModelAgent"]
+    SUP["supervisor"]
+    DA["DeepAgent"]
+  end
+  CMA --> TF["toFlowAgent(ctx, agent)"]
+  SUP --> TF
+  DA --> TF
+  TF --> FA["flowAgent<br/>embeds the original agent + collab state<br/>subAgents / parent / historyRewriter"]
+  R["Runner (thin shell)<br/>normalize input · to flowAgent · checkpoint"] --> TF
+  FA --> ITER["AsyncIterator event stream"]
+`} />
+
+
+## Runner: a thin generic shell
+
+Start with the `Runner`. Its real form is a generic struct, `TypedRunner[M]` (<SourceRef path="adk/runner.go:55" />), with just three fields: the agent to run, whether streaming is on, and an optional checkpoint store.
+
+```go
+type TypedRunner[M MessageType] struct {
+    a               TypedAgent[M]
+    enableStreaming bool
+    store           CheckPointStore
+}
+
+// The Runner you used all through Part I is one concrete instantiation of it.
+type Runner = TypedRunner[*schema.Message]
+```
+
+The `adk.NewRunner` (<SourceRef path="adk/runner.go:89" />) you called repeatedly just stuffs `Agent`, `EnableStreaming`, and `CheckPointStore` from `RunnerConfig` (<SourceRef path="adk/runner.go:68" />) into this struct. As for `Query` (<SourceRef path="adk/runner.go:108" />) and `Run` (<SourceRef path="adk/runner.go:102" />), the former merely wraps a string into a user message and delegates to the latter — both return an `*AsyncIterator`, the familiar "event stream."
+
+<Callout kind="note" title="The Runner doesn't run logic; it's an entry point">
+There is no ReAct loop, no tool dispatch, no transfer decision inside the Runner. It has exactly three jobs: normalize input, convert the agent into a `flowAgent`, and read/write the checkpoint on interrupt. The real running skeleton lives in `flowAgent`.
+</Callout>
+
+## The pivotal step: toFlowAgent unifies everything
+
+The first substantive thing `Run` does is hand your agent to `toFlowAgent` (call site at <SourceRef path="adk/runner.go:167" />, implementation at <SourceRef path="adk/flow.go:104" />):
+
+```go
+func toFlowAgent(ctx context.Context, agent Agent, opts ...AgentOption) *flowAgent {
+    var fa *flowAgent
+    var ok bool
+    if fa, ok = agent.(*flowAgent); !ok {
+        fa = &flowAgent{Agent: agent}   // an ordinary agent: wrap it
+    } else {
+        fa = fa.deepCopy()              // already a flowAgent: deep-copy it
+    }
+    // ...fill in a default historyRewriter
+    return fa
+}
+```
+
+The code is plain enough to overlook, but it's the bedrock of the whole multi-agent machinery. The `flowAgent` (<SourceRef path="adk/flow.go:42" />) **embeds** the `Agent` interface, preserving the original agent's full behavior while hanging the extra state that collaboration needs onto it:
+
+```go
+type flowAgent struct {
+    Agent                              // embedded: the original agent's abilities pass through
+
+    subAgents   []*flowAgent           // its subordinates
+    parentAgent *flowAgent             // its superior
+
+    disallowTransferToParent bool
+    historyRewriter          HistoryRewriter
+    checkPointStore          compose.CheckPointStore
+}
+```
+
+<Callout kind="key" title="The design key for this chapter">
+`flowAgent` is a **decorator**: it embeds the original agent, forwards its core behavior untouched, and only takes over the *collaboration* layer — parent/child links, RunPath, event recording, transfer. That's why a supervisor, a DeepAgent, and a lone ChatModelAgent are treated identically at runtime: whatever kind of agent you wrote, `toFlowAgent` normalizes it into one structure before the engine sees it. **"User-facing agents come in every shape; the engine only knows one."** It's this normalization that lets cancel, interrupt, resume, and event recording be implemented once yet apply to every agent.
+</Callout>
+
+## flowAgent.run(): the real skeleton
+
+`flowAgent.Run` (<SourceRef path="adk/flow.go:352" />) is the outer entry: it calls `initRunCtx` to establish this run's context, appends its own name to the "address" via `AppendAddressSegment` (<SourceRef path="adk/flow.go:357" />), prepares the input, then spawns a goroutine to run the inner `run` (<SourceRef path="adk/flow.go:478" />). The actual loop skeleton lives in that inner method, which does three things.
+
+**First, maintain the RunPath.** Every event flowing out of an agent, if it has no owner yet, is stamped with the current agent's name and run path (<SourceRef path="adk/flow.go:513" />):
+
+```go
+if len(event.RunPath) == 0 {
+    event.AgentName = a.Name(ctx)
+    event.RunPath = runCtx.RunPath
+}
+```
+
+The RunPath is the trail of "which agent chain did this event flow out of" — it's both the foundation of observability and the coordinate that lets the next chapter's checkpoint pinpoint exactly *where* a run paused.
+
+**Second, record events into the session.** Note the restrained recording policy here (<SourceRef path="adk/flow.go:519" />): only events that are non-interrupt (`Action` nil or its `Interrupted` nil) **and** whose RunPath *exactly matches* the current agent get copied into the session.
+
+```go
+if (event.Action == nil || event.Action.Interrupted == nil) && exactRunPathMatch(runCtx.RunPath, event.RunPath) {
+    copied := copyTypedAgentEvent(event)
+    // ...
+    runCtx.Session.addEvent(copied)
+}
+```
+
+Why demand an *exact* match? Because events produced inside sub-agents and tools pass through the parent on their way out, yet they **don't belong** to the parent's conversation history. This check stops the parent from mistaking a subordinate's intermediate drafts for its own memory — the runtime landing of Chapter 8's "isolated context" philosophy. Interrupt events are deliberately excluded from recording too: whatever they carry is either already shown to the user or handed to agents by other means.
+
+**Third, handle transfer.** When one agent decides to hand control to another, `run` uses `getAgent` to locate the target (<SourceRef path="adk/flow.go:557" />), calls its `Run` directly, and forwards the sub-agent's events through unchanged:
+
+```go
+if destName != "" {
+    agentToRun := a.getAgent(ctxForSubAgents, destName)
+    // ...
+    subAIter := agentToRun.Run(ctxForSubAgents, nil /* sub-agent gets input from runCtx */, opts...)
+    for {
+        subEvent, ok_ := subAIter.Next()
+        if !ok_ { break }
+        generator.Send(subEvent)
+    }
+}
+```
+
+This is the implementation of Chapter 7's "transfer = hand off control + share context": the sub-agent gets `nil` input because it reads its context from the shared `runCtx` — control flows away while the context stays put and shared. Contrast this sharply with Chapter 16's AgentTool and its "isolated context."
+
+## Environment state: runContext and runSession
+
+The `runCtx` that keeps appearing above is this run's **environment**. Its structure (<SourceRef path="adk/runctx.go:346" />) is straightforward:
+
+```go
+type runContext struct {
+    RootInput        *AgentInput   // the original user input
+    RunPath          []RunStep     // the current agent run path
+    AgenticRootInput any
+    Session          *runSession   // the session shared across agents
+}
+```
+
+Inside it, `runSession` (<SourceRef path="adk/runctx.go:34" />) is the carrier of shared context — it holds `Values` (a mutex-guarded key/value map, exactly the session store you used in Part I) and the event list. APIs like `WithSessionValues` ultimately read and write here. `initRunCtx` (<SourceRef path="adk/runctx.go:386" />) builds it at the start of each run and hangs it on the `context.Context` so it travels down the call chain.
+
+## On interrupt: freeze the whole run state into a checkpoint
+
+The last piece of skeleton is **interrupt persistence**. When an interrupt action appears in the event stream *and* you configured a `CheckPointStore` in `RunnerConfig`, the `Runner` calls `runnerSaveCheckPointImpl` (<SourceRef path="adk/interrupt.go:283" />) at <SourceRef path="adk/runner.go:331" />, serializing the current run state with `gob` and writing it to the store:
+
+```go
+err := gob.NewEncoder(buf).Encode(&serialization{
+    RunCtx:              runCtx,        // the whole run environment (session, RunPath included)
+    Info:                info,
+    InterruptID2Address: id2Addr,       // address mapping of the interrupt point
+    InterruptID2State:   id2State,
+    EnableStreaming:     enableStreaming,
+})
+// ...
+return store.Set(ctx, key, buf.Bytes())
+```
+
+Note that what gets frozen is the **entire `runContext`** — because with the precise RunPath coordinates and the full session snapshot from earlier, resuming can return to exactly the moment of interruption, no more and no less. That's why "resume" isn't a special case in the ADK but a built-in ability of the skeleton: `Resume` (<SourceRef path="adk/runner.go:124" />) and `ResumeWithParams` (<SourceRef path="adk/runner.go:147" />) do the reverse — thaw the `runContext` from the checkpoint and let the run continue in place.
+
+<Callout kind="tip" title="Try it">
+Open <SourceRef path="adk/flow.go:478" /> and read `flowAgent.run` end to end, matching it against this chapter's "three things": RunPath maintenance, session recording, transfer handling. Then ask yourself: if you removed the "exact RunPath match" check, what would the parent agent's memory become? (Hint: it would start eavesdropping on every sub-agent's inner monologue.)
+</Callout>
+
+## Chapter summary
+
+- The `Runner` is a **thin shell** (<SourceRef path="adk/runner.go:55" />): normalize input, convert to `flowAgent`, manage checkpoint I/O — no running logic of its own.
+- `toFlowAgent` (<SourceRef path="adk/flow.go:104" />) normalizes **any** agent into a `flowAgent` (<SourceRef path="adk/flow.go:42" />) — a decorator that embeds the original and takes over only the "collaboration layer." This is the root reason cancel/interrupt/recording can be "implemented once, effective everywhere."
+- `flowAgent.run` (<SourceRef path="adk/flow.go:478" />) is the real skeleton, doing three things: maintain the **RunPath**, record events into the **session** under an exact-match policy, and handle **transfer**.
+- `runContext`/`runSession` (<SourceRef path="adk/runctx.go:346" />) are the run environment shared across agents; transfer hands off context by sharing it.
+- On interrupt the whole `runContext` is frozen into a checkpoint with `gob` (<SourceRef path="adk/interrupt.go:283" />), and `Resume` thaws it back — which is why resume is a built-in ability of the skeleton, not a special case.
+
+Next chapter we zoom into one agent's interior: how ReAct is not a `for` loop but a compiled graph.

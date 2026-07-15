@@ -1,0 +1,134 @@
+## Three ways to write it, one foundation
+
+Last chapter you saw compose's execution kernel clearly: one loop plus two kinds of channel. But in real code you almost never touch channels directly — you use three user-facing builders: `Graph`, `Chain`, and `Workflow`. This chapter pins down two things: how the three relate (spoiler: the latter two are sugar over `Graph`), and a more important question — **when you wire together two nodes whose types don't line up, how does the framework manage to error out at composition time instead of blowing up in production?**
+
+<Mermaid title="Graph is the foundation; Chain/Workflow are sugar" chart={`
+flowchart TB
+  CHAIN["Chain[I,O]<br/>linear sugar<br/>nodeIdx / preNodeKeys"]
+  WF["Workflow[I,O]<br/>field-level mapping sugar<br/>DAG orchestration"]
+  GRAPH["Graph[I,O]<br/>outer generic · type-safe"]
+  INNER["*graph (internal · type-erased)<br/>nodes / edges / toValidateMap / validation"]
+  CHAIN --> GRAPH
+  WF --> GRAPH
+  GRAPH --> INNER
+`} />
+
+
+## The foundation: the generic Graph
+
+The bedrock of everything is the generic `Graph[I, O]` (<SourceRef path="compose/generic_graph.go:93" />):
+
+```go
+// I: input type of the compiled artifact; O: output type
+type Graph[I, O any] struct {
+    *graph        // embeds a non-generic internal graph
+}
+```
+
+Notice the design: the outer surface is a type-parameterized `Graph[I, O]` that gives you end-to-end type safety; inside it embeds a "type-erased" `*graph` that carries the actual nodes, edges, and validation logic. The constructor `NewGraph[I, O]` (<SourceRef path="compose/generic_graph.go:72" />) simply records `I` and `O` as two `reflect.Type` values on the internal graph. And `Chain` and `Workflow` are, at heart, "API sugar layered onto this internal graph."
+
+## Compile-time type checking: reflect.Type propagation and the hard gate
+
+Let's start with the weightiest mechanism, because it's where Eino's "type safety" promise is actually cashed in.
+
+When you call `AddEdge(a, b)` (<SourceRef path="compose/generic_graph.go:106" />), it delegates to the internal `addEdgeWithMappings` (<SourceRef path="compose/graph.go:232" />). This isn't just "record an edge" — it does two things on the spot (<SourceRef path="compose/graph.go:285" />): it registers the edge into a pending-validation table `toValidateMap`, then immediately runs `updateToValidateMap()` to check it.
+
+`toValidateMap` (field defined at <SourceRef path="compose/graph.go:65" />) is a list of "edges whose type compatibility hasn't been confirmed yet." The real checking happens in `updateToValidateMap` (<SourceRef path="compose/graph.go:561" />), which repeatedly scans the table, pulling each edge's upstream output type and downstream input type and running a `checkAssignable` (<SourceRef path="compose/graph.go:592" />):
+
+```go
+result := checkAssignable(startNodeOutputType, endNodeInputType)
+if result == assignableTypeMustNot {
+    return fmt.Errorf("graph edge[%s]-[%s]: start node's output type[%s] and end node's input type[%s] mismatch", ...)
+}
+```
+
+**If the types don't match, `AddEdge` returns an error on that very line** — not at runtime, not at Compile, but the moment you draw the connection. That's why Eino can claim "orchestration is type-safe."
+
+<Callout kind="key" title="The design key for this chapter">
+Eino's type safety rests on **compile-time type propagation plus layered validation gates**. `reflect.Type` propagates along edges through the graph: once one end's type is known, `updateToValidateMap` can infer the other end — it can even "pour" a type through an intermediate untyped passthrough node (<SourceRef path="compose/graph.go:561" />). Validation has two gates: a **hard incompatibility** (`assignableTypeMustNot`) errors right at `AddEdge`; while an **interface-involved** "might be compatible" (`assignableTypeMay`) is not hard-blocked — instead it hangs a runtime converter and defers. This "block at compile time whatever can be decided at compile time, and only fall back to runtime for what can't" layering is exactly the shift-left engineering philosophy of pushing errors as far left as possible.
+</Callout>
+
+There's a second gate, a backstop at `Compile` time (<SourceRef path="compose/graph.go:708" />):
+
+```go
+// toValidateMap isn't empty means there are nodes that cannot infer type
+for _, v := range g.toValidateMap {
+    if len(v) > 0 {
+        return nil, fmt.Errorf("some node's input or output types cannot be inferred: %v", g.toValidateMap)
+    }
+}
+```
+
+If at Compile time some edges still linger in `toValidateMap` undigested — typically a few untyped passthrough nodes chained end-to-end with no "typed anchor" anywhere to infer from — Compile refuses to produce a graph. The two gates divide labor: the first catches "wrong types wired together," the second catches "types that can't be inferred."
+
+## Chain: linear syntactic sugar
+
+Once you grasp the foundation, `Chain` is transparent. `NewChain[I, O]` (<SourceRef path="compose/chain.go:37" />) is internally `NewGraph[I, O]`, just marking components as `ComponentOfChain`. The `Chain` struct (<SourceRef path="compose/chain.go:72" />) holds that `*Graph[I, O]` plus a little linear bookkeeping: `nodeIdx` (for auto-generated node names) and `preNodeKeys` (who the previous node was).
+
+Every `AppendXxx` eventually funnels into `addNode` (<SourceRef path="compose/chain.go:560" />), whose job is endearingly plain:
+
+```go
+// auto-generate a key, add the node
+err := c.gg.addNode(nodeKey, node, options)
+// ...the first node is auto-wired from START
+if len(c.preNodeKeys) == 0 {
+    c.preNodeKeys = append(c.preNodeKeys, START)
+}
+// wire the previous node to the current one
+for _, preNodeKey := range c.preNodeKeys {
+    c.gg.AddEdge(preNodeKey, nodeKey)
+}
+c.preNodeKeys = []string{nodeKey}   // the current node becomes the next one's "upstream"
+```
+
+**Chain is just a Graph that "auto-`AddEdge`s things into a straight line"** — no new execution semantics. It doesn't even pick an execution mode; as the last chapter said, the mode is decided in `graph.compile`, and Chain still defaults to Pregel. Its value is purely eliminating the boilerplate of hand-writing linear connections.
+
+## Workflow: field-level mapping plus forced DAG
+
+`Workflow` heads the other direction: it isn't "simplify the wiring" but "upgrade the wiring's expressiveness." Look at its struct (<SourceRef path="compose/workflow.go:43" />) and its telling doc comment:
+
+```go
+// Workflow is wrapper of graph, replacing AddEdge with declaring dependencies
+// and field mappings between nodes.
+// Under the hood it uses NodeTriggerMode(AllPredecessor), so does not support cycles.
+type Workflow[I, O any] struct {
+    g                *graph
+    workflowNodes    map[string]*WorkflowNode
+    // ...
+}
+```
+
+Two keywords: **field mapping** and **AllPredecessor** (forced DAG).
+
+**Field mapping** is Workflow's biggest expressiveness upgrade. A plain `AddEdge` "feeds the upstream's whole output to the downstream"; Workflow's `AddInput` (<SourceRef path="compose/workflow.go:197" />) can be precise down to the **field level**:
+
+```go
+// map upstream A's Score field to the current node's input Rating field
+node.AddInput("A", compose.MapFields("Score", "Rating"))
+```
+
+Here `MapFields` (<SourceRef path="compose/field_mapping.go:85" />), `FromField` (<SourceRef path="compose/field_mapping.go:65" />), and `ToField` (<SourceRef path="compose/field_mapping.go:73" />) construct a `FieldMapping` (<SourceRef path="compose/field_mapping.go:31" />). Under the hood `addDependencyRelation` (<SourceRef path="compose/workflow.go:316" />) translates each mapping into one intra-graph edge carrying mappings — so field mapping is not a new engine; it still lands on the same internal graph, the edge just additionally carries "which field to take, which field to place."
+
+**Forced DAG** is a deliberate trade-off. As the last chapter covered, `graph.compile` switches to DAG mode whenever `isWorkflow(g.cmp)` is true. Why does Workflow willingly give up cycles? Because the mental model of a field-level data pipeline is naturally "data flows from upstream fields into downstream fields" — a **directed acyclic** graph; surrendering cycles buys the determinism of "trigger only when all predecessors are ready" plus the branching power that skip-propagation enables. It's a very clear-eyed product decision: **Chain trades acyclicity for linear simplicity, Workflow trades acyclicity for field-level data orchestration, and scenarios that genuinely need cycles (like ReAct) return to Pregel's Graph.**
+
+<Callout kind="note" title="How to choose among the three">
+- **Chain**: a purely linear pipeline (A→B→C) where you just want less boilerplate.
+- **Graph**: you need cycles, complex branches, or back-edges (ReAct, multi-agent loops) — runs Pregel.
+- **Workflow**: multi-input fan-in, field-precise data mapping, and naturally acyclic (form approvals, parallel research then aggregate) — runs DAG.
+
+All three share the same type-checking foundation and the same execution kernel; they diverge only in "how you declare the topology" and "which channel runs."
+</Callout>
+
+<Callout kind="tip" title="Try it">
+Write two equivalent pipelines: one with `Chain.AppendXxx`, one hand-wired with `Graph.AddNode`+`AddEdge`. Cross-check <SourceRef path="compose/chain.go:560" /> to confirm that what Chain saves you is exactly those `AddEdge` lines. Then deliberately wire two type-incompatible nodes with `AddEdge` and observe **which line** errors — `AddEdge` or `Compile`? Return to <SourceRef path="compose/graph.go:592" /> to verify your call.
+</Callout>
+
+## Chapter summary
+
+- The foundation is the generic `Graph[I, O]` (<SourceRef path="compose/generic_graph.go:93" />): type-safe on the outside, embedding a type-erased `*graph` inside to carry nodes/edges/validation.
+- **Type checking** relies on `reflect.Type` propagating along edges plus two gates: `AddEdge` runs `updateToValidateMap` on the spot (<SourceRef path="compose/graph.go:561" />), hard incompatibility errors immediately (<SourceRef path="compose/graph.go:592" />); `Compile` backstops "types can't be inferred" (<SourceRef path="compose/graph.go:708" />). Interface-involved "might be compatible" degrades to a runtime converter.
+- **Chain** (<SourceRef path="compose/chain.go:72" />) is linear sugar: `addNode` (<SourceRef path="compose/chain.go:560" />) auto-`AddEdge`s into a straight line, no new semantics, still Pregel by default.
+- **Workflow** (<SourceRef path="compose/workflow.go:43" />) upgrades wiring expressiveness: `AddInput`+`FieldMapping` (<SourceRef path="compose/field_mapping.go:31" />) do **field-level** data mapping, and **force DAG** (trading cycles for determinism).
+- The design key: all three share the type foundation and the execution kernel, diverging only in how topology is declared and which channel is chosen — **three expressivenesses grown from one foundation.**
+
+Next chapter we drill into the last two cornerstones: how streams get copied, merged, and boxed, and how state is found level-by-level by type across nested graphs — the two things that underpin ADK's streaming and memory.

@@ -1,0 +1,107 @@
+## Giving the system eyes: observable, debuggable, deployable
+
+Getting features working is just the start. Once an Agent hits production, you need to answer three questions: **what is it doing right now? when something breaks, which step failed? how do I deploy it stably?** This chapter covers Eino's observability trio — the callback mechanism, the Langfuse/APMPlus/CozeLoop integrations, and Eino Dev visualization — and the single design principle behind them: **observability shouldn't intrude on business code; it should be "injected" as an aspect.**
+
+<Mermaid title="The callback aspect: five timings, one interface, three backends" chart={`
+flowchart TB
+  GRAPH["business graph (every node auto-instrumented)"] --> H["callbacks.Handler interface<br/>OnStart / OnEnd / OnError<br/>OnStartWithStreamInput / OnEndWithStreamOutput"]
+  H -->|"swap the handler, business unchanged"| LF["Langfuse<br/>trace tree / Generation"]
+  H --> AP["APMPlus<br/>OTel metrics + span"]
+  H --> CL["CozeLoop<br/>einoTracer span"]
+  H -.->|"TimingChecker.Needed"| GATE["skip unwanted timings at zero cost"]
+`} />
+
+
+## callback: a five-timing aspect interface
+
+The bedrock of all observability is the `callbacks.Handler` interface (<SourceRef path="callbacks/interface.go:85" />, actually defined at <SourceRef path="internal/callbacks/interface.go:38" />):
+
+```go
+type Handler interface {
+    OnStart(ctx, info *RunInfo, input CallbackInput) context.Context
+    OnEnd(ctx, info *RunInfo, output CallbackOutput) context.Context
+    OnError(ctx, info *RunInfo, err error) context.Context
+    OnStartWithStreamInput(ctx, info *RunInfo, input *schema.StreamReader[CallbackInput]) context.Context
+    OnEndWithStreamOutput(ctx, info *RunInfo, output *schema.StreamReader[CallbackOutput]) context.Context
+}
+```
+
+Five methods, corresponding to five **timings**: start, end, error, plus start-with-stream-input and end-with-stream-output. Each method carries a `RunInfo` (<SourceRef path="internal/callbacks/interface.go:26" />) holding the node name, type, and component category, telling you "who is triggering this callback right now." Note each method returns a `context.Context`: this is the channel by which a handler plants state in `OnStart` and retrieves it in `OnEnd` for correlation.
+
+How does the framework invoke these callbacks? Components instrument themselves by calling aspect functions, such as `callbacks.OnStart[T]` (<SourceRef path="callbacks/aspect_inject.go:74" />):
+
+```go
+func (m *myChatModel) Generate(ctx context.Context, input []*schema.Message, ...) {
+    ctx = callbacks.OnStart(ctx, &model.CallbackInput{Messages: input})
+    resp, err := m.doGenerate(ctx, input, opts...)
+    if err != nil { callbacks.OnError(ctx, err); return nil, err }
+    callbacks.OnEnd(ctx, &model.CallbackOutput{Message: resp})
+    return resp, nil
+}
+```
+
+Business code only reports "what happened"; observation code subscribes elsewhere. And the framework **auto-injects** these callbacks around graph nodes, so you don't even hand-write them — attach a handler and every node of the whole graph is observed.
+
+<Callout kind="key" title="The design key for this chapter">
+Eino's observability is a clean **aspect-oriented (AOP)** practice: observation isn't `log.Print` scattered through business logic but is **injected from the outside** via the five-timing `Handler` interface. This yields three chained benefits. First, **zero intrusion**: the same business graph, attach Langfuse and it reports to Langfuse, attach APMPlus and it becomes OTel metrics, attach CozeLoop and it becomes spans — not a line of business code changes. Second, **controllable performance**: a handler declares via `TimingChecker.Needed` (<SourceRef path="internal/callbacks/interface.go:52" />) which timings it cares about, so timings that don't need stream copying are skipped at zero cost. Third, **order is semantics**: `OnStart` is invoked in **reverse** registration order, `OnEnd`/`OnError` in **forward** order — exactly the wrap/unwrap convention of a middleware "onion model." Observation, debugging, and tracing are all fundamentally just different handler implementations of the same aspect mechanism.
+</Callout>
+
+## Three backends, one interface
+
+Precisely because a handler is an interface, connecting the same graph to different observation backends becomes a matter of "swapping a handler":
+
+**Langfuse** (<SourceRef path="eino-ext/callbacks/langfuse/langfuse.go:128" />) — an LLM-focused trace platform. Its handler (<SourceRef path="eino-ext/callbacks/langfuse/langfuse.go:180" />) checks the component type in `OnStart`: if it's a ChatModel, it creates a `Generation` (with input messages and model metadata); otherwise a plain `Span`. Spans nest into a call tree via `ParentObservationID`. State passes between `OnStart`→`OnEnd` through a private context key (`langfuseStateKey{}`, <SourceRef path="eino-ext/callbacks/langfuse/langfuse.go:191" />).
+
+**APMPlus** — OpenTelemetry-based metrics plus tracing. It starts an OTel span in `OnStart` and records a set of histograms: token usage, call count, duration, time-to-first-token (TTFT), etc. It's "metrics"-oriented, unlike Langfuse's "trace tree" orientation, but outwardly both are the same `Handler`.
+
+**CozeLoop** — it wraps an inner tracer (`einoTracer`) in a wrapper handler; `StartSpan` in `OnStart`, `span.Finish` in `OnEnd`, and a pluggable `CallbackDataParser` turns Eino's inputs/outputs into CozeLoop span tags.
+
+The three implementations differ wildly (trace tree / OTel metrics / span), but the integration path is identical: construct a handler, then attach it globally with `callbacks.AppendGlobalHandlers(...)` or per-call with `compose.WithCallbacks(...)`. **This is the dividend of interface abstraction: the business graph knows nothing about "which observation backend."**
+
+## The performance gate for streaming callbacks
+
+There's an easily overlooked but crucial design: streaming timings. When a component's input/output is a stream, the framework gives **each handler its own independent stream copy** (using Part IV's `Copy`), so one handler consuming the stream doesn't affect others. But copying a stream has a cost — hence `TimingChecker`:
+
+```go
+type TimingChecker interface {
+    Needed(ctx, info *RunInfo, timing CallbackTiming) bool
+}
+```
+
+A handler built with `HandlerBuilder` **auto-implements** `Needed`: whichever timing's callback function is nil returns false for that timing. So a handler that doesn't consume streams is never handed a stream copy at all. **Performance isn't a matter of user care but is naturally avoided by interface design** — the "zero-cost abstraction" manifested at the observation layer. And every handler that consumes a stream must `defer input.Close()`, or the pipeline's goroutine leaks — all three official integrations obey this without exception.
+
+## Eino Dev and visualization: a diagram grown from GraphInfo
+
+Runtime traces alone aren't enough; you also want to see the graph's shape at **compile time**. Eino does this with another kind of callback: the graph compile callback `GraphCompileCallback` (<SourceRef path="compose/introspect.go:55" />):
+
+```go
+type GraphCompileCallback interface {
+    OnFinish(ctx context.Context, info *GraphInfo)
+}
+```
+
+When compilation finishes, the framework hands the callback a complete `GraphInfo` (<SourceRef path="compose/introspect.go:41" />, containing all nodes, control edges, data edges, branches, input/output types). The Mermaid visualizer works exactly this way — its entry `OnFinish` (<SourceRef path="eino-examples/devops/visualize/mermaid.go:74" />) takes the `GraphInfo`, recursively walks nodes and edges, and emits Mermaid diagram code. There's a clever heuristic: if there are **more control edges than data edges** (<SourceRef path="eino-examples/devops/visualize/mermaid.go:83" />), it deems this a Workflow and renders it with a different style — echoing Ch20's "Workflow rewrites wiring with field mapping."
+
+Going further, eino-ext's devops package provides the **Eino Dev debug server**: `devops.Init(ctx)` starts a local HTTP service (default `127.0.0.1:52538`) that, paired with an IDE plugin, lets you see the graph's topology in a browser and step-debug each node. This combines the two kinds of information — "compile-time GraphInfo + runtime callbacks" — into a visual debugging console.
+
+<Callout kind="note" title="Two kinds of callback, don't confuse them">
+- **Runtime callbacks** (`callbacks.Handler`): observe each **execution** — inputs, outputs, duration, errors. Used for Langfuse/APMPlus/CozeLoop reporting.
+- **Compile-time callbacks** (`GraphCompileCallback`): observe each **compilation** — the graph's static structure. Used for Mermaid diagrams and Eino Dev topology display.
+
+The same "callback" idea, one watching execution and one watching structure — this is observability carried into every phase of the framework.
+</Callout>
+
+## Deployment: from A2UI to full stack
+
+Back to the previous chapter's `chatwitheino`, which already demonstrated a pragmatic deployment path: a Hertz service via `hserver.Default`, registering the `/chat`, `/approve`, `/abort` routes and calling `Spin` (<SourceRef path="quickstart/chatwitheino/server/server.go:182" />), chat streamed over SSE (`sse.NewStream` plus periodic keepalives), and all configuration via environment variables. The observation handler is attached globally at `main` startup with `callbacks.AppendGlobalHandlers` (<SourceRef path="quickstart/chatwitheino/main.go:58" />), so every request reports automatically — whether CozeLoop is attached depends solely on whether the env supplies a token. **Deployment isn't a fresh start but assembling this chapter's observation + the previous chapter's application + a web framework** — still composition.
+
+## Chapter summary
+
+- The bedrock of observability is the five-timing `callbacks.Handler` interface (<SourceRef path="callbacks/interface.go:85" />); components instrument via aspect functions like `callbacks.OnStart[T]` (<SourceRef path="callbacks/aspect_inject.go:74" />), and the framework auto-injects around graph nodes.
+- **Same graph, swap the handler to swap the backend**: Langfuse builds a trace tree (<SourceRef path="eino-ext/callbacks/langfuse/langfuse.go:128" />), APMPlus emits OTel metrics, CozeLoop emits spans — zero business-code change.
+- Performance is naturally avoided via `TimingChecker.Needed` (<SourceRef path="internal/callbacks/interface.go:52" />): timings that don't consume streams cost nothing; invocation order follows the middleware onion convention of reverse/forward.
+- **Compile-time callbacks** `GraphCompileCallback` (<SourceRef path="compose/introspect.go:55" />) hand `GraphInfo` to the Mermaid visualizer (<SourceRef path="eino-examples/devops/visualize/mermaid.go:74" />) for diagrams; Eino Dev starts a local service for step debugging.
+- Deployment is composition: observation handler + application (agent + server) + Hertz/SSE, assembled into a deployable full-stack app.
+- The design key: observability is a clean AOP — observation/debugging/tracing are just different handlers of the same aspect mechanism.
+
+In the final chapter, we deep-read one genuinely complex capstone project and do a closing retrospective on the Eino design philosophy seen throughout the book.

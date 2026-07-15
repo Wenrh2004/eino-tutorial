@@ -1,0 +1,49 @@
+## A counter-intuitive starting point
+
+Most people's first ReAct implementation is a `for` loop: call the model → check for tool calls → run tools, feed results back, loop → otherwise return. That's not wrong, but it's not how Eino does it.
+
+In Eino, ReAct is **not a piece of control-flow code — it's a compiled graph**. Grasping this shift is the prerequisite for understanding all of the ADK's "advanced" abilities (cancel, interrupt, resume, observability).
+
+<Viz name="react-loop" />
+
+## Why turn a loop into a graph
+
+A `for` loop hides "what to do next" *inside Go's control flow*. That means cancellation checkpoints, mid-tool interrupts, and per-step observability all become special-case surgery on the loop body.
+
+Turn each step into a graph **node**, and "next" into an **edge**, and those abilities become generic engine features instead of ReAct special cases. That's what <SourceRef path="adk/react.go" /> does.
+
+<Callout kind="key" title="The design key of this chapter">
+Once the loop is flattened into a graph, **control flow becomes data**. "Keep looping?" is no longer an `if` statement but an edge that can be inspected, interrupted, and resumed. Every advanced ability of ReAct comes from this "control flow → data" conversion.
+</Callout>
+
+## The graph topology
+
+Following the demo, the skeleton is:
+
+1. **Init** — write user input and system prompt into initial state (entry).
+2. **ChatModel** — call the LLM, produce an assistant message.
+3. **Branch** — does the message contain `tool_calls`? No → **Exit**; Yes → the tool path.
+4. **CancelCheck** — a *safe-point* node (next section).
+5. **ToolNode** — map each `tool_call` to an `AgentAction`, run concurrently, collect back as tool messages.
+6. **AfterToolCalls** — merge tool results into state; a `returnDirectly` tool can end here.
+7. **Back-edge** — AfterToolCalls loops to ChatModel. **This cycle is the "Re" in ReAct.**
+
+## Cancel: not a kill, but a node
+
+Instead of returning in place when a context is cancelled, Eino models cancellation as a graph node — `CancelCheck`. The signal doesn't hard-abort a running node; it waits for the current node to finish cleanly, then stops the graph gracefully at the safe point.
+
+<Callout kind="note" title="Why this matters">
+Safe-point cancellation means the system always stops at a *node boundary* — exactly where state can be checkpoint-serialized (Chapter 23). Cancellation thus shares one mechanism with interrupt + resume.
+</Callout>
+
+## MaxIterations: a backstop
+
+A graph with a cycle needs a guard against infinite loops. The ReAct graph defaults to `MaxIterations = 20` (see <SourceRef path="adk/react.go" />): each back-edge counts a turn, and exceeding the cap forces Exit. It's a pragmatic safety valve, not business logic.
+
+## Mapping tool calls to AgentAction
+
+`ToolNode` maps each returned `tool_call` into an `AgentAction`, runs them concurrently, and folds results back into tool messages. This `AgentAction` abstraction is key: Chapter 16 shows it's exactly what lets "a sub-agent" masquerade as "a tool" — at this layer, both tools and agents are just "Actions that produce a result".
+
+<Callout kind="tip" title="Try it">
+Open <SourceRef path="adk/react.go" /> and <SourceRef path="adk/chatmodel.go" />, and find where this graph is built. Count the nodes it adds and the edges it wires, and match them one by one against the topology demonstrated above. Then consider: if you wanted to add a rate-limiting node *before* the model call, which edge of the graph would you insert it on?
+</Callout>

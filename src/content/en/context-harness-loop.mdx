@@ -1,0 +1,242 @@
+## How many engines actually hold up an agent runtime?
+
+Over the last few chapters we've pried the ADK wide open: ReAct is a compiled graph, cancel is a safe-point on that graph, AgentTool isolates control flow via adaptation. But if someone asked you something more *abstract* — **"what engines does an agent runtime fundamentally consist of?"** — could you answer not by reciting names, but by pointing at Eino's source?
+
+That's what this chapter does. The industry often abstracts an agent runtime into three engines:
+
+- **Context Engine** — decides *what the model sees this step*: history, instruction, visible tools, cross-step state.
+- **Harness Engine** — turns the model's *intent* into an *action*: injecting tools, intercepting via hooks, dispatching calls, deciding whether to return directly.
+- **Loop Engine** — decides *whether to go around again*: advancing the turn, watching for cancellation, stopping at safe-points and resuming.
+
+These three terms aren't Eino's vocabulary, but every one of them can be pointed to precisely in Eino's source. The goal of this chapter is to nail each abstract engine onto a concrete ADK type, so that when you read any agent framework later, you can first ask "where do its three engines live?"
+
+<Mermaid title="How the three engines map onto concrete ADK implementations" chart={`
+flowchart TB
+  subgraph CTX["Context Engine · what the model sees"]
+    RC["runContext<br/>RootInput · RunPath · Session<br/>adk/runctx.go"]
+    INS["genTransferToAgentInstruction<br/>assembled at runtime<br/>adk/instruction.go"]
+  end
+  subgraph HAR["Harness Engine · intent to action"]
+    PREP["prepareExecContext<br/>inject exit/transfer tools<br/>returnDirectly · middleware<br/>adk/chatmodel.go"]
+    HND["six hooks<br/>Before/AfterAgent...<br/>adk/handler.go"]
+  end
+  subgraph LOOP["Loop Engine · go around again?"]
+    G["ReAct compiled graph<br/>with CancelCheck safe-points<br/>adk/react.go"]
+    TL["TurnLoop.run<br/>push loop · watches cancel<br/>adk/turn_loop.go"]
+  end
+  CTX --> HAR --> LOOP
+  LOOP -.->|"back edge: one more turn"| CTX
+`} />
+
+## Minimal example: you've been driving all three already
+
+The first tool-wielding, transfer-capable agent you wrote back in Part I already drove all three engines — you just didn't look at it that way:
+
+```go
+agent, _ := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+    Name:        "researcher",
+    Instruction: "You research topics and can hand off to a writer.", // <- Context
+    Model:       chatModel,
+    ToolsConfig: adk.ToolsConfig{Tools: []tool.BaseTool{searchTool}}, // <- Harness
+    Exit:        &adk.ExitTool{},                                     // <- Harness
+})
+// writer as a sub-agent: transfer instructions get woven into the prompt // <- Context
+agent.SetSubAgents(ctx, []adk.Agent{writerAgent})
+
+runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: agent})
+events, _ := runner.Run(ctx, messages) // <- Loop: advance turn by turn until convergence
+```
+
+- `Instruction` + sub-agents → the **Context Engine** must weave the transfer notice into the system prompt at runtime.
+- `Tools` + `Exit` → the **Harness Engine** must assemble these tools (plus the auto-injected exit/transfer) into the model's visible tool set before running.
+- the event stream from `runner.Run` → the **Loop Engine** runs the ReAct graph turn by turn behind the scenes, until the model gives a final answer or triggers exit.
+
+Let's open each engine's hood in turn.
+
+## Context Engine: runContext is the container for "what this step sees"
+
+The physical carrier of the context engine is a struct threaded through the entire run, tucked inside `context.Context`: `runContext` (<SourceRef path="adk/runctx.go:346" />):
+
+```go
+type runContext struct {
+    RootInput *AgentInput   // the original input for this run
+    RunPath   []RunStep     // the call path to the current agent (appended per hop in multi-agent)
+    AgenticRootInput any
+    Session   *runSession   // state shared across steps and across agents
+}
+```
+
+It's not passed down parameter by parameter — it's stashed in `context.Context`; `getRunCtx`/`setRunCtx` (<SourceRef path="adk/runctx.go:374" />) handle store and fetch. This has one direct consequence: **anywhere that holds `ctx` can read "who I am, which path I came by, and what's in the shared state."** That's exactly what a context engine should do — it doesn't produce content, it decides content's visibility boundary.
+
+Within it, `Session` is the core of cross-step value passing (<SourceRef path="adk/runctx.go:34" />):
+
+```go
+type runSession struct {
+    Values    map[string]any   // key-value state across steps and agents
+    valuesMtx *sync.Mutex      // parallel agents read/write concurrently, so a lock is required
+    Events    []*agentEventWrapper
+    // ...
+}
+```
+
+Note that `valuesMtx`: because multi-agent runs may go in parallel, `Values` in the session is accessed concurrently, so every read/write goes through the lock (`addValue`/`getValue`, <SourceRef path="adk/runctx.go:324" />). That's concrete evidence of "a context engine must be thread-safe."
+
+But the context engine isn't only "storing history" — it also has to **dynamically generate this step's instruction**. When an agent has sub-agents, whom it may "transfer" to is only known at runtime — so `genTransferToAgentInstruction` (<SourceRef path="adk/instruction.go:48" />), before each execution, weaves the transferable agents' names and descriptions into a transfer-decision instruction:
+
+```go
+func genTransferToAgentInstruction[M MessageType](ctx context.Context, agents []TypedAgent[M]) string {
+    // ...iterate agents, build "- Agent name: X / description: Y"
+    return fmt.Sprintf(instruction, sb.String(), TransferToAgentToolName)
+}
+```
+
+**That's the context engine's second duty: context is not a static string but is assembled on the spot from the runtime topology (which sub-agents exist).**
+
+<Callout kind="note" title="Why context is stashed in context.Context">
+Go's `context.Context` is by nature a carrier that "propagates implicitly down the call chain, is readable at any depth, and is destroyed together with cancellation." By hanging `runContext` on it, the ADK gets three things for free: automatic downward propagation, readability at any layer, and cleanup on cancel. This is the first example of "carrying runtime state on a language-native mechanism" — Chapter 28 will show this idea running through the whole of Eino.
+</Callout>
+
+## Harness Engine: prepareExecContext assembles capabilities into this one call
+
+A model on its own only "generates text." To make it "use tools, transfer, exit," someone must, before each call, assemble those capabilities and tell the model "here are the actions available to you." That assembly engine is `prepareExecContext` (<SourceRef path="adk/chatmodel.go:855" />). It's the passage in this chapter most worth reading line by line:
+
+```go
+func (a *TypedChatModelAgent[M]) prepareExecContext(ctx context.Context) (*execContext, error) {
+    instruction := a.instruction
+    toolsNodeConf := a.toolsConfig.ToolsNodeConfig
+    toolsNodeConf.Tools = cloneSlice(a.toolsConfig.Tools)          // copy first, never pollute the original config
+    returnDirectly := copyMap(a.toolsConfig.ReturnDirectly)
+
+    transferToAgents := a.subAgents
+    if a.parentAgent != nil && !a.disallowTransferToParent {
+        transferToAgents = append(transferToAgents, a.parentAgent) // allow transferring back to the parent
+    }
+    if len(transferToAgents) > 0 {
+        transferInstruction := genTransferToAgentInstruction(ctx, transferToAgents)
+        instruction = concatInstructions(instruction, transferInstruction)  // <- meets the Context engine here
+        toolsNodeConf.Tools = append(toolsNodeConf.Tools, &transferToAgent{})
+        returnDirectly[TransferToAgentToolName] = true             // transfer returns directly, no extra round
+    }
+    if a.exit != nil {
+        toolsNodeConf.Tools = append(toolsNodeConf.Tools, a.exit)  // inject the exit tool
+        // ...returnDirectly[exitName] = true
+    }
+    for _, m := range a.middlewares {
+        if m.AdditionalInstruction != "" {
+            instruction = concatInstructions(instruction, m.AdditionalInstruction) // middleware appends instruction
+        }
+        toolsNodeConf.Tools = append(toolsNodeConf.Tools, m.AdditionalTools...)     // middleware appends tools
+    }
+    // ...genToolInfos produces the tool descriptions the model finally sees
+    return &execContext{instruction, toolsNodeConf, returnDirectly, ...}, nil
+}
+```
+
+Reading this passage, you'll find the harness engine must decide four things:
+
+1. **Which tools to inject**: user tools + `transferToAgent` + `exit` + tools appended by each middleware. The user never hand-wrote transfer/exit — the harness installed them.
+2. **Which tools "return directly"**: transfer and exit are marked into `returnDirectly` — once called, their result is returned as a terminal state directly, without being fed back to the model for another round. This is a control-flow-level decision.
+3. **How instructions are assembled**: base instruction + transfer notice + middleware-appended instructions, layered via `concatInstructions`. This is precisely **where the context engine and the harness engine meet** — the instruction's *content* is decided by Context, but *when and in what order* to assemble it is decided by the Harness.
+4. **Copy before mutating**: `cloneSlice`/`copyMap` guarantee each execution starts from a clean copy, never polluting this run's temporary assembly back into the agent's original config — the prerequisite for reentrancy.
+
+Once assembled, the actual "interception" happens at the hook layer. `TypedChatModelAgentMiddleware` (<SourceRef path="adk/handler.go:139" />) defines hooks like `BeforeAgent`/`AfterAgent`:
+
+```go
+type TypedChatModelAgentMiddleware[M MessageType] interface {
+    BeforeAgent(ctx context.Context, runCtx *ChatModelAgentContext) (context.Context, *ChatModelAgentContext, error)
+    AfterAgent(ctx context.Context, state *TypedChatModelAgentState[M]) (context.Context, error)
+    // BeforeModelRewriteState / WrapModel / WrapToolCall ...
+}
+```
+
+Notice all these hook signatures return `context.Context` — they can **rewrite the context and pass it onward**. That stitches Harness and Context together again: hooks are the openings the harness leaves for the user, and through them the user can turn back and modify the context engine's content (e.g. `BeforeModelRewriteState` rewrites the messages and tools about to be sent to the model). Chapter 10 discussed the execution order of these six hooks in detail; here we stress just one point: **they are the pluggable joints reserved on the "skeleton."**
+
+<Callout kind="key" title="The design key (part one)">
+The harness engine's core move is "assemble + intercept": `prepareExecContext` assembles tools, instruction and returnDirectly into a **clean, reentrant** execution config before each run; the hook layer then opens interception points at key nodes. When writing an agent, the user merely declares "which tools I have, whether to exit"; while "how to turn them into model-visible actions, which actions should terminate the run directly" — those control-flow decisions are all absorbed by the harness. This embodies the ADK's separation of "config declaration vs control-flow implementation."
+</Callout>
+
+## Loop Engine: the graph owns "the shape of one turn," TurnLoop owns "whether to go again"
+
+With a visible context and assembled tools, the remaining questions are: **how many turns, when to stop, can we stop midway and resume?** That's the loop engine's job, and Eino splits it into two layers.
+
+The first layer is **the shape of one turn** — defined by the compiled ReAct graph (<SourceRef path="adk/react.go:366" />):
+
+```go
+g := compose.NewGraph[*reactInput, Message](compose.WithGenLocalState(genReactState(config)))
+// initNode -> chatModel -> (branch) -> cancelCheck -> toolNode -> afterToolCalls -> back to chatModel
+```
+
+Chapter 14 explained: ReAct's "loop" is not a for, but the `AfterToolCalls → ChatModel` back edge in this graph (running in Pregel mode). And cancel isn't an outer `if` — it's modeled as **safe-point nodes** on the graph, e.g. `CancelCheck` (<SourceRef path="adk/react.go:399" />), which checks whether to interrupt here after the model produces tool calls:
+
+```go
+if cancelCtx != nil && cancelCtx.shouldCancel() {
+    if cancelCtx.getMode()&CancelAfterChatModel != 0 {
+        return nil, compose.StatefulInterrupt(ctx, "CancelAfterChatModel", msg)
+    }
+}
+```
+
+These safe-points are defined by `CancelMode` (<SourceRef path="adk/cancel.go:43" />), and it's a **bitmask you can OR together**:
+
+```go
+type CancelMode int
+const (
+    CancelImmediate      CancelMode = 0        // stop now, don't wait for a safe-point
+    CancelAfterChatModel CancelMode = 1 << iota // stop after the next model call
+    CancelAfterToolCalls                        // stop after the next batch of tool calls
+)
+```
+
+`CancelAfterChatModel | CancelAfterToolCalls` means "stop at whichever of the two safe-points comes first." **The loop engine isn't a binary "can we stop or not," but a composable map of "at which safe-points we may stop."**
+
+The second layer is **advancing and resuming** — owned by `TurnLoop.run` (<SourceRef path="adk/turn_loop.go:1570" />). It sits one level above the graph: the graph finishes one turn and returns, while TurnLoop decides whether that turn's result triggers the next turn, whether to restore from a checkpoint, whether to stop due to cancellation:
+
+```go
+func (l *TurnLoop[T, M]) run(ctx context.Context) {
+    defer l.cleanup(ctx)
+    if err := l.tryLoadCheckpoint(ctx); err != nil { // <- resume: try restoring from a checkpoint first
+        l.runErr = err
+        return
+    }
+    // watch ctx cancellation: on cancel, close the buffer so a blocking Receive unblocks
+    go func() {
+        select {
+        case <-ctx.Done():
+            l.buffer.Close()
+        case <-l.done:
+        }
+    }()
+    for { /* push-based main loop: take item -> run a turn -> handle interrupt/resume */ }
+}
+```
+
+Three details worth remembering: `tryLoadCheckpoint` makes the loop engine natively support "resume from the last interrupt point"; the goroutine watching `ctx.Done()` translates an "external cancel" into "close the internal buffer," so the main loop's next `Receive` unblocks and exits gracefully; and the `for` body is **push-based** — it doesn't actively "pull" the next step, but waits for events to be pushed into the buffer before consuming.
+
+<Callout kind="key" title="The design key (part two)">
+The loop engine is split into two layers so each minds its own business: the **graph** only answers "what does one turn look like, at which nodes can we safely interrupt" — it's a stateless shape; **TurnLoop** answers "go around again, can we resume, when to exit on cancel" — it holds cross-turn state. Cancel can be "precise to a safe-point yet composable" precisely because it's pushed down into the graph's nodes (the `CancelMode` bitmask) rather than tangled into loop conditionals. That's the implementation foundation for the ADK making interrupt/cancel/resume first-class.
+</Callout>
+
+## Wiring the three engines together
+
+Now look back at the opening diagram — it actually describes one run's lifecycle:
+
+1. **Context** takes its place first: `runContext` is hung on `ctx`, the session is prepared, transfer instructions are woven per the current sub-agents.
+2. **Harness** then assembles: `prepareExecContext` composes tools/instruction/returnDirectly into one clean execution, hooks in place.
+3. **Loop** starts advancing: TurnLoop drives the ReAct graph turn by turn, checking cancel at safe-points each turn, pushing events into the buffer.
+4. If the model still wants to call tools, the back edge sends control back to chatModel — **back to Context** (a new turn's model needs the latest history), and the loop continues, until a final answer or exit.
+
+These four steps aren't a new concept Eino invented — they're the skeleton any agent runtime cannot avoid. Eino's value is that it lands these three abstract engines on three **line-by-line readable** concrete types — `runContext`, `prepareExecContext`, `TurnLoop` — rather than smearing them into one gigantic `for` loop.
+
+<Callout kind="tip" title="Try it">
+Pick another agent framework you know (or an agent loop you've written yourself) and try to answer: where is its context engine (who decides what the model sees this step)? Where is its harness (who injects tools, who intercepts calls)? Where is its loop engine (who decides to go again, whether to resume)? If all three are smeared into one function, think about what pulling them apart would buy you — against Eino's `runContext`/`prepareExecContext`/`TurnLoop` split, the cost of "coupling" becomes easier to see.
+</Callout>
+
+## Chapter summary
+
+- An agent runtime can be abstracted into three engines: **Context (what this step sees)**, **Harness (intent to action)**, **Loop (go around again?)**. These terms are an industry abstraction, but each nails onto a concrete Eino type.
+- **Context Engine** = `runContext` (<SourceRef path="adk/runctx.go:346" />) hung on `context.Context`, `Session` (<SourceRef path="adk/runctx.go:34" />) carrying locked cross-step state, `genTransferToAgentInstruction` (<SourceRef path="adk/instruction.go:48" />) assembling instructions from the runtime topology.
+- **Harness Engine** = `prepareExecContext` (<SourceRef path="adk/chatmodel.go:855" />) cleanly and reentrantly assembling tools/instruction/returnDirectly before each run, the hook interface (<SourceRef path="adk/handler.go:139" />) opening pluggable interception joints.
+- **Loop Engine** in two layers: the ReAct compiled graph (<SourceRef path="adk/react.go:366" />) defines "the shape of one turn" and models cancel as safe-points (the `CancelMode` bitmask, <SourceRef path="adk/cancel.go:43" />); `TurnLoop.run` (<SourceRef path="adk/turn_loop.go:1570" />) handles advancing, resuming and cancel-exit.
+- The design key: split the three engines into **line-by-line readable independent types** rather than one big loop — that's the prerequisite for the ADK making interrupt/cancel/resume first-class.
+
+That closes Part III — you've now seen what's under the hood of the ADK machine. Next, Part IV descends one more level: the ADK's streaming, type-safety, and parallelism all come from the compose orchestration engine underneath. The next chapter starts with `Runnable` and the auto-adaptation of the four execution paradigms.

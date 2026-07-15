@@ -1,0 +1,107 @@
+## 给系统装上眼睛:可观测、可调试、可上线
+
+功能跑通只是开始。一个 Agent 上了生产,你要能回答三个问题:**它现在在做什么?出问题时哪一步错了?我怎么把它稳定地部署出去?** 这一章讲 Eino 的可观测性三件套——callback 机制、Langfuse/APMPlus/CozeLoop 集成、Eino Dev 可视化——以及它们背后同一个设计原则:**观测能力不该侵入业务代码,而应作为切面被"注入"。**
+
+<Mermaid title="callback 切面:五时机,一个接口,三种后端" chart={`
+flowchart TB
+  GRAPH["业务图（每个节点自动埋点）"] --> H["callbacks.Handler 接口<br/>OnStart / OnEnd / OnError<br/>OnStartWithStreamInput / OnEndWithStreamOutput"]
+  H -->|"换 handler,业务零改动"| LF["Langfuse<br/>trace 树 / Generation"]
+  H --> AP["APMPlus<br/>OTel 指标 + span"]
+  H --> CL["CozeLoop<br/>einoTracer span"]
+  H -.->|"TimingChecker.Needed"| GATE["不关心的时机零开销跳过"]
+`} />
+
+
+## callback:一个五时机的切面接口
+
+一切可观测性的地基,是 `callbacks.Handler` 这个接口(<SourceRef path="callbacks/interface.go:85" />,实际定义在 <SourceRef path="internal/callbacks/interface.go:38" />):
+
+```go
+type Handler interface {
+    OnStart(ctx, info *RunInfo, input CallbackInput) context.Context
+    OnEnd(ctx, info *RunInfo, output CallbackOutput) context.Context
+    OnError(ctx, info *RunInfo, err error) context.Context
+    OnStartWithStreamInput(ctx, info *RunInfo, input *schema.StreamReader[CallbackInput]) context.Context
+    OnEndWithStreamOutput(ctx, info *RunInfo, output *schema.StreamReader[CallbackOutput]) context.Context
+}
+```
+
+五个方法,对应五个**时机**:开始、结束、出错,以及流式输入的开始、流式输出的结束。每个方法都带一个 `RunInfo`(<SourceRef path="internal/callbacks/interface.go:26" />)——里面有节点名、类型、组件类别,告诉你"现在是谁在触发这个回调"。注意每个方法都返回 `context.Context`:这是 handler 在 `OnStart` 里种下状态、`OnEnd` 里取回来做关联的通道。
+
+框架怎么调这些回调?组件在自己的方法里主动埋点,调用切面函数,比如 `callbacks.OnStart[T]`(<SourceRef path="callbacks/aspect_inject.go:74" />):
+
+```go
+func (m *myChatModel) Generate(ctx context.Context, input []*schema.Message, ...) {
+    ctx = callbacks.OnStart(ctx, &model.CallbackInput{Messages: input})
+    resp, err := m.doGenerate(ctx, input, opts...)
+    if err != nil { callbacks.OnError(ctx, err); return nil, err }
+    callbacks.OnEnd(ctx, &model.CallbackOutput{Message: resp})
+    return resp, nil
+}
+```
+
+业务代码只管"发生了什么",观测代码在别处订阅。而且框架会在**图节点外面自动注入**这些回调,所以你甚至不用手写——挂上 handler,整张图的每个节点就都被观测到了。
+
+<Callout kind="key" title="本章的设计钥匙">
+Eino 的可观测性是一次干净的**面向切面(AOP)**实践:观测不是散落在业务逻辑里的 `log.Print`,而是通过五时机的 `Handler` 接口**从外部注入**。这带来三个连锁的好处。其一,**零侵入**:同一份业务图,挂 Langfuse 就上报到 Langfuse,挂 APMPlus 就变成 OTel 指标,挂 CozeLoop 就成 span——业务代码一行不改。其二,**性能可控**:handler 通过 `TimingChecker.Needed`(<SourceRef path="internal/callbacks/interface.go:52" />)声明自己只关心哪些时机,不需要流拷贝的时机就零开销跳过。其三,**顺序即语义**:`OnStart` 按注册的**逆序**调用、`OnEnd`/`OnError` 按**正序**调用——完全是中间件"洋葱模型"的包裹/解包约定。观测、调试、追踪,本质上都是同一个切面机制的不同 handler 实现而已。
+</Callout>
+
+## 三种后端,同一个接口
+
+正因为 handler 是接口,接同一份图到不同观测后端就成了"换一个 handler"的事:
+
+**Langfuse**(<SourceRef path="eino-ext/callbacks/langfuse/langfuse.go:128" />)——LLM 专用的 trace 平台。它的 handler(<SourceRef path="eino-ext/callbacks/langfuse/langfuse.go:180" />)在 `OnStart` 里判断组件类型:如果是 ChatModel,就建一个 `Generation`(带输入消息、模型元数据);否则建一个普通 `Span`。span 之间靠 `ParentObservationID` 嵌套成一棵调用树。状态通过 context 里的私有 key(`langfuseStateKey{}`,<SourceRef path="eino-ext/callbacks/langfuse/langfuse.go:191" />)在 `OnStart`→`OnEnd` 间传递。
+
+**APMPlus**——基于 OpenTelemetry 的指标 + 追踪。它在 `OnStart` 起一个 OTel span,同时记录 token 用量、调用次数、耗时、首 token 延迟(TTFT)等一组直方图。它是"指标"取向的,和 Langfuse 的"trace 树"取向不同,但对外都是同一个 `Handler`。
+
+**CozeLoop**——它用一个包装 handler 套一个内部 tracer(`einoTracer`),`OnStart` 里 `StartSpan`、`OnEnd` 里 `span.Finish`,并用可插拔的 `CallbackDataParser` 把 Eino 的输入输出转成 CozeLoop 的 span 标签。
+
+三者实现天差地别(trace 树 / OTel 指标 / span),但接入方式完全一致:构造 handler,然后 `callbacks.AppendGlobalHandlers(...)` 全局挂上,或 `compose.WithCallbacks(...)` 单次调用挂上。**这就是接口抽象的红利:业务图对"用哪个观测后端"一无所知。**
+
+## 流式回调的性能闸门
+
+有个容易忽略但很关键的设计:流式时机。当组件的输入/输出是流,框架会给**每个 handler 各发一份独立的流拷贝**(用 Part IV 的 `Copy`),这样一个 handler 消费流不会影响别人。但流拷贝有成本——所以有了 `TimingChecker`:
+
+```go
+type TimingChecker interface {
+    Needed(ctx, info *RunInfo, timing CallbackTiming) bool
+}
+```
+
+用 `HandlerBuilder` 构造的 handler 会**自动实现** `Needed`:哪个时机的回调函数是 nil,就对哪个时机返回 false。于是不消费流的 handler,框架根本不给它拷流。**性能不是靠使用者小心,而是靠接口设计天然规避**——这是"零成本抽象"在观测层的体现。而每个消费流的 handler 都必须 `defer input.Close()`,否则会漏掉 pipeline 的 goroutine——三个官方集成无一例外都遵守。
+
+## Eino Dev 与可视化:从 GraphInfo 长出一张图
+
+光有运行时的 trace 还不够,你还想在**编译期**就看清图长什么样。Eino 用另一类回调做到:图编译回调 `GraphCompileCallback`(<SourceRef path="compose/introspect.go:55" />):
+
+```go
+type GraphCompileCallback interface {
+    OnFinish(ctx context.Context, info *GraphInfo)
+}
+```
+
+编译完成时,框架把一份完整的 `GraphInfo`(<SourceRef path="compose/introspect.go:41" />,含所有节点、控制边、数据边、分支、输入输出类型)交给回调。Mermaid 可视化器就是这么工作的——它的入口 `OnFinish`(<SourceRef path="eino-examples/devops/visualize/mermaid.go:74" />)拿到 `GraphInfo` 后,递归遍历节点和边,吐出一段 Mermaid 图代码。有个巧妙的判定:如果**控制边数量多于数据边**(<SourceRef path="eino-examples/devops/visualize/mermaid.go:83" />),就认定这是个 Workflow,用不同的样式渲染——这正好呼应 Ch20 讲的"Workflow 用字段映射改写连线"。
+
+更进一步,`eino-ext` 的 devops 包提供了 **Eino Dev 调试服务器**:`devops.Init(ctx)` 启一个本地 HTTP 服务(默认 `127.0.0.1:52538`),配合 IDE 插件,你能在浏览器里看图的拓扑、单步调试每个节点。这就是把"编译期 GraphInfo + 运行期 callback"两类信息合起来,变成一个可视化调试台。
+
+<Callout kind="note" title="两类回调,别混淆">
+- **运行时回调**(`callbacks.Handler`):观测每次**执行**——输入、输出、耗时、错误。用于 Langfuse/APMPlus/CozeLoop 上报。
+- **编译期回调**(`GraphCompileCallback`):观测每次**编译**——图的静态结构。用于 Mermaid 出图、Eino Dev 拓扑展示。
+
+同一个"回调"思想,一个盯执行、一个盯结构——这是把可观测性贯彻到框架每个阶段的体现。
+</Callout>
+
+## 部署:从 A2UI 到全栈
+
+回到上一章的 `chatwitheino`,它已经示范了一条务实的部署路径:用 Hertz `hserver.Default` 起 HTTP 服务、注册 `/chat`、`/approve`、`/abort` 等路由并 `Spin`(<SourceRef path="quickstart/chatwitheino/server/server.go:182" />),聊天走 SSE 流式推送(`sse.NewStream` + 定时心跳保活),配置全部走环境变量。而观测 handler 在 `main` 启动时用 `callbacks.AppendGlobalHandlers` 全局挂上(<SourceRef path="quickstart/chatwitheino/main.go:58" />),于是每次请求都自动上报——挂不挂 CozeLoop 只取决于环境变量是否给了 token。**部署不是另起炉灶,而是把这一章的观测 + 上一章的应用 + 一个 Web 框架拼起来**——依然是组合。
+
+## 本章小结
+
+- 可观测性的地基是五时机的 `callbacks.Handler` 接口(<SourceRef path="callbacks/interface.go:85" />),组件用切面函数 `callbacks.OnStart[T]` 等(<SourceRef path="callbacks/aspect_inject.go:74" />)主动埋点,框架在图节点外自动注入。
+- **同一份图,换 handler 就换后端**:Langfuse 建 trace 树(<SourceRef path="eino-ext/callbacks/langfuse/langfuse.go:128" />)、APMPlus 出 OTel 指标、CozeLoop 出 span——业务代码零改动。
+- 性能靠 `TimingChecker.Needed`(<SourceRef path="internal/callbacks/interface.go:52" />)天然规避:不消费流的时机零开销;调用顺序遵循中间件逆序/正序的洋葱约定。
+- **编译期回调** `GraphCompileCallback`(<SourceRef path="compose/introspect.go:55" />)把 `GraphInfo` 交给 Mermaid 可视化器(<SourceRef path="eino-examples/devops/visualize/mermaid.go:74" />)出图;Eino Dev 起本地服务做单步调试。
+- 部署即组合:观测 handler + 应用(agent + server)+ Hertz/SSE,拼成可上线的全栈应用。
+- 设计钥匙:可观测性是一次干净的 AOP——观测/调试/追踪只是同一个切面机制的不同 handler。
+
+最后一章,我们挑一个真正复杂的综合项目深读,并对全书所见的 Eino 设计哲学做一次收束式的复盘。

@@ -1,0 +1,135 @@
+## 从哪里开始读 Eino
+
+Eino 生态有三个仓库,第一次接触很容易迷路:
+
+- **`eino`** —— 框架本体。既有底层的编排引擎(`compose`),也有面向应用的 **ADK**(Agent Development Kit,`adk` 包)。
+- **`eino-ext`** —— 官方扩展。各家大模型、向量库、检索器、回调上报(Langfuse / APMPlus / CozeLoop)等具体实现。
+- **`eino-examples`** —— 可运行的范例与完整应用(本书主线示例 `chatwitheino`:一个能读文档、答问题、带人工审批的 Agent 应用)。
+
+很多教程会从最底层的 `compose` 图引擎讲起。这套教程反过来:**从 ADK 讲起**。因为 ADK 才是你写 Agent 时真正每天打交道的那一层,而它把「模型 + 工具 + 记忆 + 中断 + 多智能体」收敛成了一套统一的运行时。先把这一层用顺、想透,再回头看底下的引擎(Part IV),你会发现每一个「高级能力」都有迹可循。
+
+<Mermaid title="三仓库关系与分层" chart={`
+flowchart TB
+  subgraph eino["eino （框架本体）"]
+    ADK["adk 包 · ADK<br/>模型/工具/记忆/中断/多智能体"]
+    Compose["compose 包 · 图引擎<br/>Runnable / Graph / Checkpoint"]
+    ADK -->|"编译成图，继承能力"| Compose
+  end
+  Ext["eino-ext<br/>模型 / 向量库 / 检索器 / 回调上报"]
+  Examples["eino-examples<br/>主线示例 · chatwitheino"]
+  Ext -.->|"实现组件接口"| eino
+  Examples -.->|"组合使用"| eino
+  Examples -.-> Ext
+`} />
+
+
+<Callout kind="key" title="本章的设计钥匙">
+ADK 不是「另一个 Agent 框架」,而是**架在 compose 图引擎之上的一层薄适配**。它的几乎所有能力——流式、中断、续跑、取消、可组合——都不是它自己发明的,而是从底层图引擎「继承」来的。理解这句话,是理解全书的起点。
+</Callout>
+
+## ADK 的世界观:一个 Agent 就是一个「事件流生成器」
+
+在 ADK 里,「Agent」不是一个会 `return` 一段文字的函数,而是一个**持续吐出事件流**的东西。这一点被直接编码进了核心接口 `TypedAgent[M]`(见 <SourceRef path="adk/interface.go:453" />):
+
+```go
+type TypedAgent[M MessageType] interface {
+    Name(ctx context.Context) string
+    Description(ctx context.Context) string
+    Run(ctx context.Context, input *TypedAgentInput[M],
+        options ...AgentRunOption) *AsyncIterator[*TypedAgentEvent[M]]
+}
+```
+
+注意 `Run` 的返回值不是 `(Output, error)`,而是一个 `*AsyncIterator[...]`——一个可以不断 `Next()` 取出事件的迭代器。默认情况下我们用的 `Agent` 就是 `M = *schema.Message` 的特化(<SourceRef path="adk/interface.go:467" />):
+
+```go
+type Agent = TypedAgent[*schema.Message]
+```
+
+为什么是事件流而不是一次性返回?因为 Agent 运行时会发生很多「值得被外界看到」的中间事件:模型开始输出了、要调用某个工具了、子 Agent 中断了等待人工审批了……把这些都建模成一条事件流,上层(比如一个 Web UI)就能实时地把它们渲染出来,而不必等 Agent 彻底跑完。第 8 章会把这个世界观讲透,这里先建立直觉。
+
+## 一个事件里装了什么
+
+每次 `Next()` 取出的是一个 `TypedAgentEvent[M]`(<SourceRef path="adk/interface.go:419" />),它的结构很能说明 ADK 在意什么:
+
+```go
+type TypedAgentEvent[M MessageType] struct {
+    AgentName string          // 是哪个 Agent 发出的
+    RunPath   []RunStep       // 框架维护的调用路径
+    Output    *TypedAgentOutput[M]  // 一段输出(消息或流)
+    Action    *AgentAction    // 一个控制流动作
+    Err       error
+}
+```
+
+`Output` 和 `Action` 是两条正交的线:`Output` 是「内容」(模型说了什么),`Action` 是「控制流」(接下来要做什么)。而 `AgentAction`(<SourceRef path="adk/interface.go:357" />)把 Agent 能做的「控制流决策」枚举了出来:
+
+```go
+type AgentAction struct {
+    Exit            bool                   // 结束运行
+    Interrupted     *InterruptInfo         // 中断,等待外部输入
+    TransferToAgent *TransferToAgentAction // 把控制权交给另一个 Agent
+    BreakLoop       *BreakLoopAction       // 跳出循环
+    CustomizedAction any
+}
+```
+
+把「控制流」显式建模成数据(一个 `Action` 结构体),而不是藏在 Go 的 `if/return` 里——这是 ADK 反复出现的核心手法。正因为控制流是数据,它才能被序列化、被中断、被恢复。整本教程你会一次次看到这个母题。
+
+## Runner:你与 Agent 之间的入口
+
+你几乎不会直接调用 `agent.Run`。真正的入口是 `Runner`(<SourceRef path="adk/runner.go:55" />),它在 Agent 外面包了一层,统一负责回调、命名、运行路径、取消监控,以及**最重要的——中断时的 checkpoint 持久化**:
+
+```go
+type TypedRunner[M MessageType] struct {
+    a               TypedAgent[M]
+    enableStreaming bool
+    store           CheckPointStore
+}
+```
+
+用起来只有两步——构造再跑:
+
+```go
+runner := adk.NewRunner(ctx, adk.RunnerConfig{
+    Agent:           myAgent,
+    EnableStreaming: true,
+})
+
+iter := runner.Query(ctx, "帮我查一下明天北京的天气")
+for {
+    event, ok := iter.Next()
+    if !ok {
+        break // 事件流耗尽
+    }
+    // 处理 event...
+}
+```
+
+`Query`(<SourceRef path="adk/runner.go:108" />)是 `Run` 的语法糖:它把一个字符串包成一条 user 消息,再调 `Run`。这个 `for { Next() }` 循环,就是你消费任何 Agent 输出的统一姿势,后面每一章都在用它。
+
+<Callout kind="note" title="checkpoint 为什么在 Runner 这一层">
+`Runner` 持有 `CheckPointStore`。这不是巧合:中断/续跑要跨进程、跨请求存活,必须有人在「Agent 之外」保管状态。Runner 就是这个保管人。第 5 章你会用到它,第 13、15 章会看到它内部如何把状态桥接到底层 compose 引擎。
+</Callout>
+
+## ADK 是怎么架在 compose 之上的
+
+前面说 ADK 是「薄适配」,这里给出证据。`ChatModelAgent`(下一章的主角)内部并不是自己写循环,而是**构建了一张真实的 compose 图并编译执行**(见 <SourceRef path="adk/chatmodel.go:1139" />):它 `compose.NewChain[...]()` 拼出链路,用 `chain.Compile(ctx, ...)` 编译成 `Runnable`,再 `Invoke` / `Stream`。
+
+连 checkpoint 类型都是直接复用底层的(<SourceRef path="adk/runner.go:64" />):
+
+```go
+type CheckPointStore = core.CheckPointStore
+```
+
+这就是为什么本教程的顺序是「ADK 优先、引擎收尾」:你在 ADK 层用到的流式、中断、续跑,追到底都会落到 compose 引擎里。先在 ADK 建立完整的使用直觉,Part IV 再把引擎盖打开,你会有「原来如此」的连贯感,而不是从一堆底层原语里硬拼出上层能力。
+
+## 本章小结
+
+- Eino 有三个仓库:`eino`(框架)、`eino-ext`(扩展)、`eino-examples`(范例)。
+- ADK 把「模型 + 工具 + 记忆 + 中断 + 多智能体」统一成一套运行时,是你日常写 Agent 的那一层。
+- 核心世界观:**Agent = 事件流生成器**;控制流被显式建模成 `AgentAction` 数据。
+- `Runner` 是统一入口,并在中断时负责 checkpoint 持久化。
+- ADK 架在 `compose` 图引擎之上,高级能力都是「继承」来的。
+
+下一章,我们就动手把第一个 `ChatModelAgent` 跑起来,看清 `Runner.Run` / `Query` 与事件流消费的完整姿势。

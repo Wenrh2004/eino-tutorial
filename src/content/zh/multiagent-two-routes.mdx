@@ -1,0 +1,87 @@
+## 一个 Agent 不够用的时候
+
+单个 Agent 什么都想干,往往什么都干不好:工具太多它选不准,指令太长它抓不住重点,不同领域的知识互相干扰。自然的解法是**分工**——把大问题拆给多个专精的 Agent。
+
+但"多个 Agent 怎么协作"这件事,藏着 Eino 全书最重要的一个设计分歧。这一章我们先把两条主流路线各跑通一次,亲手感受差别;下一部分(第 9 章)再上升到设计哲学的高度去辩论。
+
+<Viz name="agent-tool-vs-transfer" />
+
+对照上面的可视化:**左边是 transfer(转移)**,控制权像接力棒一样从一个 Agent 交到另一个,大家共享同一份对话上下文;**右边是 agent-as-tool(智能体即工具)**,主 Agent 像调用普通工具一样"调用"子 Agent,子 Agent 在**隔离的上下文**里跑完,只把结果交回来。这两种拓扑,就是本章要跑通的两条路线。
+
+## 路线一:Supervisor —— 集中协调
+
+第一条路线是 supervisor(主管):一个居中的主管 Agent 负责调度,把任务派给各个子 Agent,子 Agent 只能和主管对话、彼此之间不直接通信。这是经典的中心辐射(hub-and-spoke)结构。
+
+```go
+import "github.com/cloudwego/eino/adk/prebuilt/supervisor"
+
+sup, _ := supervisor.New(ctx, &supervisor.Config{
+    Supervisor: coordinatorAgent,          // 居中调度的主管
+    SubAgents:  []adk.Agent{researcher, writer, reviewer}, // 被调度的专家
+})
+
+runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: sup})
+iter := runner.Query(ctx, "写一篇关于 Eino 的技术博客")
+```
+
+它的构造(<SourceRef path="adk/prebuilt/supervisor/supervisor.go:101" />)做了一件关键的事:给每个子 Agent 包一层 `AgentWithDeterministicTransferTo`,强制它们干完活后**转移回主管**。这样就形成了"主管派活 → 子 Agent 干活 → 交回主管 → 主管再决策"的循环。
+
+<Callout kind="warning" title="源码给 Supervisor 标了 NOT RECOMMENDED">
+注意 `supervisor.New` 的文档注释(<SourceRef path="adk/prebuilt/supervisor/supervisor.go:98" />)明确写着 **NOT RECOMMENDED**:supervisor 建立在 agent transfer + 完整上下文共享之上,经验上并未被证明更有效,官方建议多数场景改用 `ChatModelAgent` + `AgentTool` 或 `DeepAgent`。为什么共享上下文是问题?这正是第 9 章要展开的核心辩论。我们先把它跑通、感受它,再理解为什么不推荐。
+</Callout>
+
+## 路线二:DeepAgent —— 智能体即工具
+
+第二条路线是 DeepAgent,它代表 Eino 更推崇的组合方式:把子 Agent 当**工具**用。
+
+```go
+import "github.com/cloudwego/eino/adk/prebuilt/deep"
+
+agent, _ := deep.New(ctx, &deep.Config{
+    Name:        "lead",
+    ChatModel:   chatModel,
+    Instruction: "你是团队负责人,把子任务派给合适的专家。",
+    SubAgents:   []adk.Agent{researcher, writer, reviewer},
+})
+```
+
+构造入口是 `deep.New`(<SourceRef path="adk/prebuilt/deep/deep.go:171" />,内部走泛型版 `NewTyped` <SourceRef path="adk/prebuilt/deep/deep.go:116" />)。它的巧妙之处在于:所有子 Agent 不是被平铺成一堆工具,而是被收敛成**一个统一的 `task` 工具**(<SourceRef path="adk/prebuilt/deep/deep.go:131" /> 的 task tool middleware)。主 Agent 想派活时就调用 `task`,由它把子任务分发给对应专家。
+
+这和 supervisor 的本质区别是:子 Agent 在**隔离的上下文**里执行,主 Agent 只看到它的最终产出,而不是它满地的中间草稿。这就是可视化右侧那条路线——干净的输入进、干净的结果出。
+
+<Callout kind="key" title="本章的设计钥匙">
+两条路线的分水岭是**上下文的边界**。Supervisor 让所有 Agent 泡在同一份共享上下文里(transfer 语义),彼此的中间过程互相可见、互相污染;DeepAgent 把每个子 Agent 关进隔离的上下文(agent-as-tool 语义),只交换"输入→输出"。隔离带来三样东西:**可组合**(子 Agent 能被任意嵌套复用)、**可控**(主 Agent 不被子 Agent 的噪声淹没)、**中断可传播**(子 Agent 里的中断能穿透工具边界冒到顶层——这一点第 16 章会看到实现)。记住这个"边界"直觉,第 9 章的辩论就水到渠成。
+</Callout>
+
+## 路线三(进阶):Plan-Execute-Replan
+
+除了这两条主线,ADK 还预置了第三种更结构化的范式:先规划、再执行、按需重规划。它的构造(<SourceRef path="adk/prebuilt/planexecute/plan_execute.go:862" />)其实是把前几章学过的编排原语拼起来:
+
+```go
+// 概念结构:Sequential(Planner, Loop(Executor, Replanner))
+peAgent, _ := planexecute.New(ctx, &planexecute.Config{
+    Planner:   planexecute.NewPlanner(ctx, ...),   // 先出一份可执行计划
+    Executor:  planexecute.NewExecutor(ctx, ...),  // 执行计划的第一步
+    Replanner: planexecute.NewReplanner(ctx, ...), // 评估进度,改计划或收尾
+})
+```
+
+它是一个 `Sequential`(顺序):先跑 `Planner` 出计划,再进入一个 `Loop`(循环)反复"执行一步 → 重规划"。`Replanner`(<SourceRef path="adk/prebuilt/planexecute/plan_execute.go:807" />)在判断任务完成时,通过 `respond` 工具触发 `NewBreakLoopAction` 跳出循环。默认最多循环 10 轮(<SourceRef path="adk/prebuilt/planexecute/plan_execute.go:851" />)。
+
+这个范式的价值在于**显式的计划**:适合步骤多、需要中途纠偏的任务。它也顺带印证了一件事——多智能体不是只有"谁调用谁"这一个维度,还有"如何编排它们的时序"。这三种预置 Agent(supervisor / DeepAgent / plan-execute)各代表一种组合范式,第 11 章会系统对比。
+
+## 两条路线,先建立手感
+
+现在你已经把三种预置多智能体都跑通了。回到开头的可视化再看一眼:transfer 是"交接控制权+共享上下文",agent-as-tool 是"调用+隔离上下文"。这不是两种等价的写法,而是两种**世界观**——它决定了系统能否组合、能否控制、中断能否传播。
+
+不必现在就下判断。Part I 的目标是"会用"和"有感觉";我们已经把单 Agent → 工具 → 记忆 → 中断续跑 → 中间件 → 多智能体这条主线完整走了一遍。接下来 Part II 才正式进入"为什么这样设计"的正文。
+
+## 本章小结
+
+- 单 Agent 力不从心时,用多智能体**分工**;协作方式主要有两条路线。
+- **Supervisor**(<SourceRef path="adk/prebuilt/supervisor/supervisor.go:101" />):中心辐射、共享上下文、transfer 语义——源码标注 **NOT RECOMMENDED**。
+- **DeepAgent**(<SourceRef path="adk/prebuilt/deep/deep.go:171" />):agent-as-tool、隔离上下文、子 Agent 收敛成单个 `task` 工具——官方推荐路线。
+- **Plan-Execute-Replan**(<SourceRef path="adk/prebuilt/planexecute/plan_execute.go:862" />):`Sequential(Planner, Loop(Executor, Replanner))`,显式计划+按需重规划。
+- 分水岭是**上下文的边界**:隔离带来可组合、可控、中断可传播——这是第 9 章辩论的伏笔。
+
+Part I 到此结束。下一部分,我们打开设计的正文:从 ADK 的世界观(Agent = 事件流生成器)讲起,直抵全教程的高潮——组合哲学之争。

@@ -1,0 +1,120 @@
+## 工具:让 Agent 能「做事」而不只是「说话」
+
+没有工具的 Agent 只会说话。一旦装上工具,它就能查天气、读文件、调 API——模型负责「决定调用哪个工具、传什么参数」,框架负责「真正执行并把结果喂回去」。这一章拆开这套契约。
+
+<Mermaid title="模型出主意,框架干活" chart={`
+flowchart LR
+  M["模型<br/>决定调哪个工具 + 参数(JSON)"] -->|"ToolCall"| F["框架 · ToolsNode<br/>按名字找工具并执行"]
+  F -->|"argumentsInJSON"| T["工具实现<br/>InvokableRun / StreamableRun"]
+  T -->|"结果字符串"| F
+  F -->|"作为 Tool 消息喂回"| M
+`} />
+
+
+先看给 Agent 加工具的样子:
+
+```go
+agent, _ := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+    Name:        "assistant",
+    Instruction: "你可以使用工具来完成任务。",
+    Model:       chatModel,
+    ToolsConfig: adk.ToolsConfig{
+        ToolsNodeConfig: compose.ToolsNodeConfig{
+            Tools: []tool.BaseTool{weatherTool, searchTool},
+        },
+    },
+})
+```
+
+注意工具是通过 `ToolsConfig` **声明式**地配置的——ADK 没有 `agent.AddTool(...)` 这类可变方法。为什么?下一节的「不可变绑定」会解释。
+
+## 工具的三层接口
+
+工具接口定义在 <SourceRef path="components/tool/interface.go" />,是一个渐进式的三层设计:
+
+```go
+// 第一层:只提供「我是什么」
+type BaseTool interface {
+    Info(ctx context.Context) (*schema.ToolInfo, error)
+}
+
+// 第二层:可被同步调用
+type InvokableTool interface {
+    BaseTool
+    InvokableRun(ctx context.Context, argumentsInJSON string, opts ...Option) (string, error)
+}
+
+// 第三层:可流式调用
+type StreamableTool interface {
+    BaseTool
+    StreamableRun(ctx context.Context, argumentsInJSON string, opts ...Option) (*schema.StreamReader[string], error)
+}
+```
+
+这个分层很讲究:
+
+- **`BaseTool` 已经够用来「告诉模型有这个工具」**。模型选工具只需要 schema(名字、描述、参数),不需要能执行。所以只实现 `BaseTool` 的工具也能被 `WithTools` 传给模型。
+- 要真正**执行**,才需要 `InvokableTool`(同步返回字符串)或 `StreamableTool`(流式返回)。
+- 参数以 **JSON 字符串** 的形式传入(`argumentsInJSON`),返回也是字符串。这是模型世界与 Go 世界的边界:模型吐 JSON,工具收 JSON。
+
+<Callout kind="note" title="还有增强版接口">
+源码里还有 `EnhancedInvokableTool` / `EnhancedStreamableTool`(<SourceRef path="components/tool/interface.go:67" />),它们用结构化的 `*schema.ToolArgument` / `*schema.ToolResult` 取代裸字符串,支持多模态。当一个工具同时实现了标准版和增强版,ToolsNode 会优先用增强版。入门阶段用标准版即可。
+</Callout>
+
+## ToolInfo:模型「看到」的工具样子
+
+模型并不知道你的 Go 函数长什么样,它只看到 `ToolInfo`(定义在 `schema/tool.go`):
+
+```go
+type ToolInfo struct {
+    Name string             // 唯一名字
+    Desc string             // 何时/为何用它——写给模型看的
+    Extra map[string]any
+    *ParamsOneOf            // 参数 schema;nil 表示无参数
+}
+```
+
+`ParamsOneOf` 有两种写法(<SourceRef path="components/tool/interface.go" /> 对应的 `schema/tool.go`):要么用 `map[string]*ParameterInfo` 手写参数,要么直接给一个 JSON Schema。每个 `ParameterInfo` 带 `Type` / `Desc` / `Required` / `Enum` 等,这些字段最终会拼成发给模型的工具定义。
+
+**`Desc` 是工具能不能被正确调用的关键**:它是模型判断「什么时候该用这个工具」的唯一依据。写「查询天气」和写「根据城市名和日期查询未来天气预报,输入城市中文名」,模型的调用准确率天差地别。
+
+## 为什么工具绑定是不可变的
+
+模型侧绑定工具的接口在 <SourceRef path="components/model/interface.go:95" /> 附近——`ToolCallingChatModel`:
+
+```go
+type ToolCallingChatModel interface {
+    BaseChatModel
+    WithTools(tools []*schema.ToolInfo) (ToolCallingChatModel, error)
+}
+```
+
+关键在返回值:`WithTools` **返回一个新的模型实例**,而不是修改原来的。文档明确说这是为了并发安全——你可以把一个基础模型跨 goroutine 共享,每次 `WithTools` 派生出一个带不同工具集的新实例,互不干扰。
+
+对比一下已废弃的老接口 `ChatModel.BindTools(...)error`:它**就地修改** receiver,因此有数据竞争风险,已被标注废弃。
+
+<Callout kind="key" title="本章的设计钥匙">
+「不可变绑定返回新实例」是贯穿 Eino 的一条纪律。它换来的是**可共享、可组合、无数据竞争**:同一个基础模型能被多个 Agent 安全复用。这也解释了为什么 `ToolsConfig` 是声明式的——工具集在 Agent 构造时就固定下来,而不是运行中可变的状态。可变性是并发的敌人,Eino 用「派生新实例」把它挡在门外。
+</Callout>
+
+运行时,ChatModelAgent 正是通过这个选项把工具喂给模型的(<SourceRef path="adk/chatmodel.go" />):它收集所有工具的 `Info`,在调用模型时 `model.WithTools(toolInfos)` 传进去。你在 Config 里写 `Tools`,框架在运行时翻译成 `WithTools`——这就是「ChatModelAgent 用 `model.WithTools` 配置工具」的完整链路。
+
+## 两个「特殊工具」:Exit 与 returnDirectly
+
+有两个和工具相关、但容易混淆的机制:
+
+**Exit 工具**不是自动注入的。只有你在 Config 里设置了 `Exit`(<SourceRef path="adk/chatmodel.go:295" />),框架才会把它加入工具集并生成 Exit 动作;不设就没有。ADK 提供了现成的 `ExitTool`(<SourceRef path="adk/chatmodel.go:597" />),它接受一个 `final_result` 参数,被调用时发出 `NewExitAction()` 结束运行。
+
+**returnDirectly** 是「调用即返回」:正常情况下工具结果会被喂回模型继续循环,但如果某工具名列在 `ToolsConfig.ReturnDirectly`(<SourceRef path="adk/chatmodel.go:141" />)里,它一被调用,agent 就直接把结果作为最终输出返回,不再进模型。这对「最后一步就是执行某个动作」的工具很有用。
+
+值得一提:框架会**自动**往 `returnDirectly` 里加两项——transfer 工具和 Exit 工具(<SourceRef path="adk/chatmodel.go:141" />对应的运行时逻辑)。因为这两个天然就是「调用即终结当前流程」。
+
+## 本章小结
+
+- 工具让 Agent 能「做事」;通过 `ToolsConfig` **声明式**配置,没有可变的 AddTool。
+- 工具接口三层:`BaseTool`(仅描述)→ `InvokableTool`(同步)→ `StreamableTool`(流式);参数走 JSON 字符串边界。
+- `ToolInfo` 是模型看到的工具样子,`Desc` 直接决定调用准确率。
+- 工具绑定 `WithTools` **返回新实例**(不可变),换来并发安全与可组合性。
+- `Exit` 工具需显式配置;`returnDirectly` 让工具「调用即返回」,transfer/exit 会被自动加入。
+
+下一章,我们让 Agent 拥有记忆——看清 session 如何跨步骤传值、历史如何维护,以及事件流怎么变成 SSE。

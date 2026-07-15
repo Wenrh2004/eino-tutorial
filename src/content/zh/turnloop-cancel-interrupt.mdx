@@ -1,0 +1,112 @@
+## 从"拉"到"推"
+
+第 14 章你看到 ReAct 是一张编译好的图,第 13 章你看到 `flowAgent` 如何驱动它。但还有一个问题没回答:当运行需要**长期存活**——比如一个能被随时追加输入、随时喊停、随时中断续跑的对话会话——谁来当那个"总调度"?
+
+答案是 `TurnLoop`。如果说 `flowAgent.run` 是"一次运行"的骨架,`TurnLoop` 就是"多轮会话"的骨架。它把前面所有机制(事件流、取消、中断、checkpoint)拧成一个可长期运行的循环。这一章我们拆开三样东西:推送式的事件循环、取消的安全点状态机、以及连接 ADK 与底层 compose 的**双层 checkpoint 桥**。
+
+<Viz name="checkpoint-resume" />
+
+先记住上面这张图的两条流,后面反复用到:**横向**是控制流沿节点前进,**纵向**是同一份状态被序列化进 checkpoint、再还原。`TurnLoop` 的全部复杂度,都是在管好这两条流的交汇点。
+
+## TurnLoop:一个推送式事件循环
+
+`TurnLoop[T, M]`(<SourceRef path="adk/turn_loop.go:896" />)是一个双泛型结构:`T` 是你推给它的输入项类型,`M` 是消息类型。它对外只有四个动词:
+
+```go
+func (l *TurnLoop[T, M]) Run(ctx context.Context)                       // 启动循环
+func (l *TurnLoop[T, M]) Push(item T, opts ...PushOption[T, M]) (bool, <-chan struct{}) // 推入一项
+func (l *TurnLoop[T, M]) Stop(opts ...StopOption)                       // 请求停止
+func (l *TurnLoop[T, M]) Wait() *TurnLoopExitState[T, M]                // 等待退出
+```
+
+`Run`(<SourceRef path="adk/turn_loop.go:1350" />)只启动一次(靠 `runOnce sync.Once` 保证),真正的循环体在私有的 `run`(<SourceRef path="adk/turn_loop.go:1570" />)里。`Push`(<SourceRef path="adk/turn_loop.go:1381" />)把新输入塞进内部 buffer 并返回一个 channel 让你等这一项被处理完;`Stop`(<SourceRef path="adk/turn_loop.go:1524" />)请求优雅退出;`Wait`(<SourceRef path="adk/turn_loop.go:1565" />)阻塞到 `done` channel 关闭。
+
+<Callout kind="note" title='为什么是"推",不是"拉"'>
+Part I 里你用 `iter.Next()` 主动"拉"事件,那适合一问一答。但一个长期会话需要**外部随时能推入新消息**、**内部持续产出事件**——这是典型的生产者/消费者。`TurnLoop` 因此内建一对异步管道:`AsyncIterator`(消费端 `Next`)与 `AsyncGenerator`(生产端 `Send`),二者由 `NewAsyncIteratorPair`(<SourceRef path="adk/utils.go:57" />)成对创建,底层是一个无界 channel(<SourceRef path="adk/utils.go:31" />)。推送式循环让"追加输入"和"消费事件"彻底解耦。
+</Callout>
+
+循环每处理一项,就调用 `runAgentAndHandleEvents`(<SourceRef path="adk/turn_loop.go:1809" />)去跑一轮 Agent。这里有个精巧的设计:它并不直接把 Agent 的事件流交给外层,而是先建一个 `bridgeStore`(<SourceRef path="adk/turn_loop.go:1820" />)、用它构造一个内层 `TypedRunner`(<SourceRef path="adk/turn_loop.go:1836" />),再新开一对代理管道(<SourceRef path="adk/turn_loop.go:1877" />),用一个 goroutine 把内层事件逐条 `Send` 转发到外层(<SourceRef path="adk/turn_loop.go:1896" />)。为什么要套这一层?下一节的 checkpoint 桥会揭晓。
+
+## 取消:一台安全点状态机
+
+第 14 章说过,取消不是 `kill`,而是"跑到安全点再优雅停下"。这一章我们看它的实现。核心是 `CancelMode`(<SourceRef path="adk/cancel.go:43" />),它枚举了三个"停在哪"的策略:
+
+```go
+const (
+    CancelImmediate      CancelMode = 0        // 收到信号立即取消,不等安全点
+    CancelAfterChatModel CancelMode = 1 << iota // 等当前 ChatModel 调用结束
+    CancelAfterToolCalls                         // 等当前这轮工具调用结束
+)
+```
+
+这三档对应图里的两类安全点 `SafePoint`(<SourceRef path="adk/turn_loop.go:1056" />):`AfterChatModel` 和 `AfterToolCalls`,以及"两者皆可"的 `AnySafePoint`。你通过 `WithCancel()`(<SourceRef path="adk/cancel.go:217" />)拿到一个取消函数,调用它就触发 `triggerCancel`(<SourceRef path="adk/cancel.go:423" />)。
+
+真正判断"现在该不该停"的,是一个原子状态机 `cancelContext`(<SourceRef path="adk/cancel.go:301" />)。它的 `mode` 字段用原子操作读写,`shouldCancel()`(<SourceRef path="adk/cancel.go:466" />)和 `isImmediateCancelled()`(<SourceRef path="adk/cancel.go:482" />)在每个安全点被查询,决定是继续还是收尾。
+
+<Callout kind="key" title="本章的设计钥匙">
+取消被实现成一台**安全点状态机**,而不是一次硬中断。这样做的深层原因是:**取消和中断共用同一套底盘**。看 `wrapIterWithCancelCtx`(<SourceRef path="adk/cancel.go:806" />)这个包装器——它拦截事件流,当发现根 Agent 在安全点抛出了一个"内部中断信号"、且此刻确实该取消时,就把这个中断**就地翻译成一个 `CancelError`** 往外送(<SourceRef path="adk/cancel.go:820" />)。换句话说:**取消 = 在安全点主动触发一次中断,再把中断结果解读成"已取消"**。第 14 章那句"取消天然和中断续跑共用机制",在这里落到了实处——同一个安全点,既是中断的落点,也是取消的落点。
+</Callout>
+
+## 中断的家族与序列化
+
+取消复用的那套"中断",本身是一个有层次的家族。最基础的是 `Interrupt`(<SourceRef path="adk/interrupt.go:88" />),它产生一个带中断动作的事件;`StatefulInterrupt`(<SourceRef path="adk/interrupt.go:123" />)在此之上额外携带一份可恢复的状态;泛型版是 `TypedInterrupt`(<SourceRef path="adk/interrupt.go:59" />)。
+
+真正让"隔离的子 Agent 也能把中断冒到顶层"的,是 `CompositeInterrupt`(<SourceRef path="adk/interrupt.go:156" />)及其泛型版 `TypedCompositeInterrupt`(<SourceRef path="adk/interrupt.go:129" />)——它能把若干个子中断信号(`InterruptSignal`)**聚合**成一个复合中断。第 16 章 AgentTool 让中断穿透工具边界,用的正是它。
+
+而"续跑"需要的一切,都被打包进一个可 `gob` 序列化的结构 `serialization`(<SourceRef path="adk/interrupt.go:210" />):
+
+```go
+type serialization struct {
+    RunCtx              *runContext             // 整个运行环境(第 13 章)
+    Info                *InterruptInfo          // 兼容旧版
+    EnableStreaming     bool
+    InterruptID2Address map[string]Address      // 中断 id → 节点地址
+    InterruptID2State   map[string]core.InterruptState // 中断 id → 状态
+}
+```
+
+对照 `ResumeInfo`(<SourceRef path="adk/interrupt.go:33" />):恢复时读出这份结构,按 `InterruptID2Address` 找回"停在哪个节点",按 `InterruptID2State` 还原"当时的局部状态"。这就是可视化里那条**纵向流**的数据本体。
+
+## 双层 checkpoint:bridgeStore 的桥
+
+现在回答前面留的悬念:为什么 `TurnLoop` 要在中间套一个 `bridgeStore`(<SourceRef path="adk/interrupt.go:325" />)?
+
+因为 ADK 的中断有**两层**。底层的 compose 图引擎(第 23 章)有它自己的 checkpoint 机制,当 ReAct 图在某个节点中断,是 compose 引擎先把图的状态写进一个 store。但 ADK 这一层还想在外面再包一轮会话级的状态。两层各写各的,谁来拼接?
+
+答案就是 `bridgeStore`——一个内存版的 `CheckPointStore`(`Get`/`Set` 见 <SourceRef path="adk/interrupt.go:330" /> 附近),它约定了一个固定的桥接 key:
+
+```go
+const bridgeCheckpointID = "adk_react_mock_key"
+```
+
+流程是这样的:内层 compose/runner 中断时,把图的 checkpoint 字节写进 `bridgeStore` 的 `bridgeCheckpointID` 槽位;`TurnLoop` 随后通过 `finalizeCheckpoint`(<SourceRef path="adk/turn_loop.go:1921" />)把这段字节从 `bridgeStore` 里**拉回来**,拼进自己的会话级 checkpoint:
+
+```go
+finalizeCheckpoint := func() error {
+    if store != nil && ms != nil {
+        data, ok, err := ms.Get(ctx, bridgeCheckpointID) // 从 bridgeStore 取回底层 checkpoint
+        // ...
+        if ok {
+            l.checkPointRunnerBytes = append([]byte{}, data...) // 拼进 TurnLoop 的状态
+        }
+    }
+    return nil
+}
+```
+
+恢复时反向:用 `newResumeBridgeStore`(<SourceRef path="adk/interrupt.go:319" />)把之前存下的字节重新塞回桥的槽位,底层引擎再从这里读回图状态。`newBridgeStore`(<SourceRef path="adk/interrupt.go:315" />)则用于全新一轮。
+
+<Callout kind="note" title='为什么要"桥"而不是"合并"'>
+两层用同一套底层机制(都是 `CheckPointStore` 接口),但语义边界不同:compose 层管的是"一张图停在哪个节点",ADK 层管的是"整个会话停在哪一轮、还有哪些外部输入待处理"。`bridgeStore` 用一个固定 key 做交接,既让两层各自独立演进,又保证续跑时能严丝合缝地对接。这正是可视化里纵向流"落盘→还原"在跨层场景下的真实实现——一份状态,两层协作写入。
+</Callout>
+
+## 本章小结
+
+- `TurnLoop`(<SourceRef path="adk/turn_loop.go:896" />)是**多轮会话**的骨架:`Run`/`Push`/`Stop`/`Wait` 四个动词,内部是推送式生产者/消费者循环。
+- 推送式管道由 `AsyncIterator`/`AsyncGenerator` 成对构成(<SourceRef path="adk/utils.go:57" />),让"追加输入"与"消费事件"解耦。
+- 取消是一台**安全点状态机**:`CancelMode`(<SourceRef path="adk/cancel.go:43" />)三档策略对应 `SafePoint`(<SourceRef path="adk/turn_loop.go:1056" />),由 `cancelContext`(<SourceRef path="adk/cancel.go:301" />)原子判定。
+- 关键统一:`wrapIterWithCancelCtx`(<SourceRef path="adk/cancel.go:806" />)在安全点把中断信号**翻译成 `CancelError`**——取消与中断共用同一套底盘。
+- 中断家族:`Interrupt`/`StatefulInterrupt`/`CompositeInterrupt`(<SourceRef path="adk/interrupt.go:156" />),续跑状态打包进 `serialization`(<SourceRef path="adk/interrupt.go:210" />)。
+- **双层 checkpoint** 靠 `bridgeStore`(<SourceRef path="adk/interrupt.go:325" />)+ 固定 key `bridgeCheckpointID` 桥接:内层 compose 写入,`TurnLoop.finalizeCheckpoint`(<SourceRef path="adk/turn_loop.go:1921" />)拉回拼装。
+
+下一章我们看这套"中断能穿透边界"的能力如何成就一个精巧的抽象:AgentTool——让一个完整的 Agent 伪装成一个普通工具,却把控制流牢牢隔离。

@@ -1,0 +1,114 @@
+## 一个消息类型不够用了
+
+第 8 章埋过一个伏笔:所有 ADK 类型都带着 `[M MessageType]`,而 `MessageType` 只允许两种消息——`*schema.Message` 和 `*schema.AgenticMessage`。这一章补完 Part II 的最后一块拼图:**v0.9 为什么要把整套 ADK 泛型化?**
+
+答案要从经典 `schema.Message` 的局限说起。它诞生于"纯文本对话"时代:一个 `Content string` 装文本,一个 `ToolCalls` 装工具调用。但当模型进入**多模态 + 富内容块**时代——一条助手消息里可能同时有推理过程、生成的图片、几个工具调用——把这些全塞进一个扁平结构就捉襟见肘了。
+
+## AgenticMessage:内容块的容器
+
+新的 `AgenticMessage`(<SourceRef path="schema/agentic_message.go:71" />)换了一种建模思路:
+
+```go
+type AgenticMessage struct {
+    Role          AgenticRoleType       // system / user / assistant
+    ContentBlocks []*ContentBlock       // 核心:一条消息 = 一串内容块
+    ResponseMeta  *AgenticResponseMeta  // token 用量、各家扩展
+    Extra         map[string]any
+}
+```
+
+对比经典 `Message` 你会发现两个刻意的删减:**没有 `Content string`,也没有顶层 `ToolCalls`**。一切内容——文本、图像、推理、工具调用、工具结果——都统一表达成 `ContentBlocks` 里的一颗颗块。角色也收敛成三个:`system` / `user` / `assistant`(<SourceRef path="schema/agentic_message.go:66" />),连"tool"角色都没有——工具结果作为内容块挂在 user 消息里。
+
+<Mermaid title="AgenticMessage:一条消息 = 一串内容块" chart={`
+flowchart TB
+  MSG["AgenticMessage<br/>Role: assistant"]
+  MSG --> CBS["ContentBlocks []*ContentBlock"]
+  CBS --> B1["ContentBlock<br/>Type = reasoning"]
+  CBS --> B2["ContentBlock<br/>Type = assistant_gen_text"]
+  CBS --> B3["ContentBlock<br/>Type = assistant_gen_image"]
+  CBS --> B4["ContentBlock<br/>Type = function_tool_call"]
+  B1 -.填充.-> P1["Reasoning *Reasoning"]
+  B2 -.填充.-> P2["AssistantGenText *…"]
+  B3 -.填充.-> P3["AssistantGenImage *…"]
+  B4 -.填充.-> P4["FunctionToolCall *…"]
+`} />
+
+
+## ContentBlock:一个"带标签的联合"
+
+`ContentBlock`(<SourceRef path="schema/agentic_message.go:102" />)是这套设计的心脏。它**不是接口,而是一个带判别字段的结构体**(tagged union):
+
+```go
+type ContentBlock struct {
+    Type ContentBlockType // 判别器:这是哪种块
+
+    Reasoning         *Reasoning          // 推理/思考
+    UserInputText     *UserInputText      // 用户文本
+    UserInputImage    *UserInputImage     // 用户图片
+    AssistantGenText  *AssistantGenText   // 助手生成文本
+    AssistantGenImage *AssistantGenImage  // 助手生成图片
+    FunctionToolCall  *FunctionToolCall   // 工具调用
+    FunctionToolResult *FunctionToolResult // 工具结果
+    // …还有 audio/video/file、server tool、MCP 等一长串
+}
+```
+
+规则很简单:`Type` 说明这是哪种块,对应的那个指针字段被填,其余为 `nil`。块的种类由 `ContentBlockType` 常量枚举(<SourceRef path="schema/agentic_message.go:40" />):`reasoning`、`user_input_text/image/audio/video/file`、`assistant_gen_text/image/audio/video`、`function_tool_call/result`,以及 server tool、MCP 一整套。
+
+<Callout kind="note" title="为什么用结构体联合而不是 Go 接口">
+Go 没有原生的 sum type。用接口 + 类型断言也能表达"多态块",但序列化(gob/JSON)、跨语言对齐、字段可发现性都会变差。用"判别字段 + 一组指针"的结构体联合,换来的是:字段一目了然、序列化直接、消费方 `switch block.Type` 就能穷尽处理。这是在 Go 里表达 sum type 的务实惯用法。
+</Callout>
+
+## 泛型化:一套骨架,两种消息
+
+有了两种消息类型,真正的问题来了:难道要把 Runner、Agent、中间件、模型接口全部**写两遍**吗?v0.9 的答案是泛型——用一个类型参数 `M` 把两者统一。
+
+枢纽是 `model.BaseModel[M]`(<SourceRef path="components/model/interface.go:36" />):
+
+```go
+type BaseModel[M messageType] interface {
+    Generate(ctx context.Context, input []M, opts ...Option) (M, error)
+    Stream(ctx context.Context, input []M, opts ...Option) (*schema.StreamReader[M], error)
+}
+```
+
+一个泛型接口,`M` 一填,两种模型就都有了。而且——关键——**老代码一行不用改**,因为熟悉的名字都成了别名:
+
+```go
+type BaseChatModel = BaseModel[*schema.Message]         // 经典 chat 模型
+type AgenticModel  = BaseModel[*schema.AgenticMessage]  // 新的 agentic 模型
+```
+
+<Callout kind="key" title="本章的设计钥匙">
+泛型化的本质是**用一个类型参数消掉一整套重复**。Runner、事件流、中间件、模型——只写一份带 `[M]` 的实现,`M=*schema.Message` 就是经典 chat 世界,`M=*schema.AgenticMessage` 就是多模态 agentic 世界。两个世界共享同一套运行时骨架(第 8 章的事件流)、同一套中断续跑、同一套多智能体组合,却各自持有最贴合的消息模型。而 `BaseChatModel` 等别名保证了这场大重构对存量用户**完全透明**——这正是"用类型系统承载演进"的典范:能力翻倍,概念不增,旧代码不碎。
+</Callout>
+
+## 封闭联合:自由与克制的平衡
+
+你可能会问:既然泛型了,为什么不允许用户自定义第三种消息类型?看 `MessageType` 的定义(<SourceRef path="adk/interface.go:43" />):
+
+```go
+type MessageType interface {
+    *schema.Message | *schema.AgenticMessage
+}
+```
+
+这是一个**封闭联合**——外部包无法往里加类型。源码注释直言:正因为成员固定,框架内部的泛型函数才能用**穷尽的类型 switch**安全地处理所有情况。如果放开,任何一处 `switch m.(type)` 都会漏掉未知类型,整个类型安全的承诺就崩了。
+
+这是一处深思熟虑的克制:泛型给了"一套代码两种消息"的复用,封闭联合给了"编译期穷尽"的安全。两者合起来,才是既灵活又不失控的演进。
+
+## 两种消息如何互通
+
+既然工具节点产出的是经典 `*schema.Message`,agentic 世界怎么消费?Eino 没有在 `schema` 包里塞一个双向转换器,而是在需要的接缝处按需转换——工具结果的 `Message → AgenticMessage` 桥接落在 `compose/agentic_tools_node.go`(如 `toolMessageToAgenticMessage`)。加上流式场景的合并原语 `ConcatAgenticMessages`(<SourceRef path="schema/agentic_message.go:901" />)把分片块按 `Index` 归并——两种消息在各自的地盘里自洽,只在边界做最小的、单向的适配。
+
+## 本章小结（兼 Part II 复盘）
+
+- 经典 `Message`(扁平文本+ToolCalls)撑不起多模态富内容;`AgenticMessage`(<SourceRef path="schema/agentic_message.go:71" />)用 **ContentBlocks** 统一承载一切内容。
+- `ContentBlock`(<SourceRef path="schema/agentic_message.go:102" />)是**判别字段 + 一组指针**的结构体联合,是 Go 里表达 sum type 的务实惯用法。
+- 泛型 `BaseModel[M]`(<SourceRef path="components/model/interface.go:36" />)+ 别名(`BaseChatModel` / `AgenticModel`)= 一套骨架两种消息,且对旧代码透明。
+- `MessageType`(<SourceRef path="adk/interface.go:43" />)是**封闭联合**,换来编译期穷尽的类型安全。
+- 两种消息在边界按需单向转换,不引入全局双向转换器。
+
+至此 Part II 收官。回望这一部分,Eino 的设计哲学其实只有一条主线:**把"控制流""消息""能力"全都建模成可组合、可序列化的数据,再用类型系统兜底**——于是流式、中断、多智能体、多模态,都成了同一套地基上长出的自然结果。
+
+下一部分,我们打开引擎盖,看这套优雅的设计在 `Runner`、`flowAgent`、图引擎里究竟是**怎么实现**的。

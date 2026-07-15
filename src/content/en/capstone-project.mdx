@@ -1,0 +1,177 @@
+## Capstone: Reading a Production-Grade Agent App, and a Whole-Book Retrospective
+
+We've reached one of the final chapters. Over twenty-odd chapters you started from ADK's worldview, understood how agents get composed, empowered, and orchestrated, then descended into the compose engine to see the graph runtime underneath it all. Last chapter we read a RAG pipeline as a single Workflow. Now we put the last puzzle piece on the table — reading `chatwitheino`, a **complete, runnable Agent application**: it uses the `deep` prebuilt to stand up an agent that reads documents and answers questions, layers on three capabilities (skills / approval / safe-tool) via middleware, and wires it through a `TurnLoop` into an SSE service that supports human approval and is interruptible/resumable. By the end you'll notice every mechanism the book taught is here, each in its place.
+
+## App Skeleton: One main, Three Things
+
+First, how the whole app comes up. `main` selects a message type by environment variable (`AgenticMessage` or plain `Message`), then enters `runTyped` (<SourceRef path="quickstart/chatwitheino/main.go:38" />). `runTyped` does exactly three things (<SourceRef path="quickstart/chatwitheino/main.go:69" />):
+
+```go
+func runTyped[M adk.MessageType](ctx context.Context) {
+    agent, err := buildAgentTyped[M](ctx)          // 1. build the agent
+    checkpointStore := adkstore.NewInMemoryStore()  // 2. checkpoint store for interrupt/resume
+    store, err := mem.NewStore[M](sessionDir)       // 3. session history (JSONL on disk)
+    srv := server.New[M](server.Config[M]{
+        Agent:           agent,
+        CheckPointStore: checkpointStore,
+        Store:           store,
+        // ...
+    })
+    srv.Spin()
+}
+```
+
+One agent, one checkpoint store, one session store, injected into the server, then `Spin` starts the HTTP service (<SourceRef path="quickstart/chatwitheino/server/server.go:182" />). Note the layering: **the agent is the "brain," the server is the "shell," the checkpoint is the "save file you can pause and resume anytime"** — the three are wired together via interface injection, not fused into one lump. This is the compositional stance the whole book keeps returning to.
+
+## deep.NewTyped: Layering Capabilities onto the Agent
+
+`buildAgentTyped` is a concentrated display of the book's composition philosophy. It first builds a ChatModel and a local file backend, then builds last chapter's RAG tool, then **layers on three capabilities via middleware** (<SourceRef path="quickstart/chatwitheino/agent.go:39" />):
+
+```go
+var handlers []adk.TypedChatModelAgentMiddleware[M]
+if skillsDir, ok := resolveSkillsDir(); ok {
+    // optional: filesystem skill middleware
+    handlers = append(handlers, skillMiddleware)
+}
+handlers = append(handlers,
+    newApprovalMiddleware[M](),          // approval gate (detailed below)
+    helpers.NewSafeToolMiddleware[M](),  // turn tool errors into strings, not aborts
+)
+
+cfg := &deep.TypedConfig[M]{
+    Name:         "ChatWithEinoAgent",
+    ChatModel:    cm,
+    Backend:      backend,
+    MaxIteration: 50,
+    Handlers:     handlers,                       // three middleware layers
+    ToolsConfig:  /* Tools: []tool.BaseTool{ragTool} */,
+}
+helpers.ApplyMessageModelRetry(cfg)  // one more layer: auto-retry on model rate limits
+return deep.NewTyped[M](ctx, cfg)
+```
+
+Look at how it's stacked: the business has just "one RAG tool," but around it the `Handlers` array layers on skills, approval, and safe-tool middleware in turn, and `ApplyMessageModelRetry` wraps model calls in a "429 auto-retry" layer (<SourceRef path="quickstart/chatwitheino/helpers/retry.go:32" />). **Every layer is an aspect wrapped on from the outside; the agent's core logic doesn't change a line.** This is what Ch10–11's "capabilities injected via middleware" looks like in a real app: to add a capability, `append` one more handler to the array.
+
+`SafeToolMiddleware` is a small but crucial design (<SourceRef path="quickstart/chatwitheino/helpers/middleware.go:34" />): it **turns ordinary tool-execution errors into a string returned to the model** (instead of crashing the whole agent), while letting "interrupt-class errors" pass through — because those aren't failures, they're a pause to wait for a human (<SourceRef path="quickstart/chatwitheino/helpers/middleware.go:44" />). When a tool fails, the model should "see the error and try another approach," not terminate the whole turn.
+
+<Callout kind="key" title="The Design Key of This Chapter">
+`buildAgentTyped` is a full review of the book's composition philosophy: it invents no new type for "a document-Q&A agent with approval" — it just stacks a RAG tool, a chain of middleware, and a retry wrapper into `deep.TypedConfig` like building blocks. Capability isn't inherited; it's **aspects appended layer by layer**. To remove approval, delete one line from the array. This confirms Eino's deepest claim — **an Agent is not a special runtime, but a composition of "model + tools + a stack of middleware."** Once "orchestration" is polished to be general enough, "how to build a production-grade agent" degenerates into "which handlers to put in the array." That is Eino's Agent design philosophy.
+</Callout>
+
+## Human-in-the-Loop: One Interrupt, Threading the Whole Book
+
+The most instructive move in this app is fitting the `answer_from_document` RAG tool with a **human approval gate**: before actually reading the document, pause and ask the user "may I search this document?" See `approvalMiddleware.WrapInvokableToolCall` (<SourceRef path="quickstart/chatwitheino/agent.go:122" />):
+
+```go
+func (m *approvalMiddleware[M]) WrapInvokableToolCall(...) (adk.InvokableToolCallEndpoint, error) {
+    if tCtx.Name != "answer_from_document" {
+        return endpoint, nil        // all other tools pass through unchanged
+    }
+    return func(ctx context.Context, args string, opts ...tool.Option) (string, error) {
+        wasInterrupted, _, storedArgs := tool.GetInterruptState[string](ctx)
+        if !wasInterrupted {
+            // first entry: not yet approved → interrupt, save the tool args into the checkpoint
+            return "", tool.StatefulInterrupt(ctx, &commontool.ApprovalInfo{
+                ToolName: tCtx.Name, ArgumentsInJSON: args,
+            }, args)
+        }
+        // resumed: read the user's approval result
+        isTarget, hasData, data := tool.GetResumeContext[*commontool.ApprovalResult](ctx)
+        if isTarget && hasData {
+            if data.Approved {
+                return endpoint(ctx, storedArgs, opts...)   // approved → actually run the tool
+            }
+            return fmt.Sprintf("tool '%s' disapproved", tCtx.Name), nil  // denied → return a line
+        }
+        // ...
+    }, nil
+}
+```
+
+This is a grand performance of the book's interrupt-resume machinery: on the first call to `answer_from_document`, the middleware doesn't run the tool — it uses `tool.StatefulInterrupt` (Ch13) to **save the tool args into the checkpoint and interrupt**; once the user replies "approve/deny," it reads the result with `tool.GetResumeContext` — approve runs the RAG tool for real, deny returns an explanation. You've seen this machinery repeatedly: Ch13 (first HITL), Ch23 (checkpoint resume), Ch24 (GraphTool's nested interrupt), last chapter (the RAG tool's built-in checkpoint). **Interrupt-resume is not one agent's feature — it's a general capability the engine gives every tool and graph.**
+
+## TurnLoop: Wiring One Agent into an Approval-Capable Service
+
+The hard part: HTTP is one-request-one-response, while "interrupt — wait for human — resume" spans multiple requests. `chatwitheino` bridges this with `adk.TurnLoop`. `newLoop` assembles three callbacks into one loop (<SourceRef path="quickstart/chatwitheino/server/server.go:570" />):
+
+```go
+cfg := adk.TurnLoopConfig[*ChatItem, M]{
+    GenInput:      s.makeGenInput(sess, sessionID),      // build agent input from session history
+    PrepareAgent:  s.makePrepareAgent(),                 // supply the agent
+    OnAgentEvents: s.makeOnAgentEvents(sess, sessionID), // bridge agent events to SSE
+}
+if s.cfg.CheckPointStore != nil {
+    cfg.Store = s.cfg.CheckPointStore
+    cfg.CheckpointID = sessionID
+    cfg.GenResume = s.makeGenResume()                    // feed the approval result back on resume
+}
+return adk.NewTurnLoop(cfg)
+```
+
+Line the three HTTP routes up against the TurnLoop and the whole human-approval loop becomes clear:
+
+- **`POST /chat`** (<SourceRef path="quickstart/chatwitheino/server/server.go:283" />): user sends a message → push a `ChatItem` → `GenInput` builds it plus history into agent input (`EnableStreaming: true`, <SourceRef path="quickstart/chatwitheino/server/server.go:587" />) → when the agent reaches `answer_from_document` it interrupts → `OnAgentEvents` bridges the "needs approval" event through a channel to the SSE handler, which pushes it to the frontend (<SourceRef path="quickstart/chatwitheino/server/server.go:643" />). The turn's intermediate messages are persisted into session history, and the interrupt ID is recorded on the session.
+- **`POST /approve`** (<SourceRef path="quickstart/chatwitheino/server/server.go:427" />): user clicks "approve/deny" → a new loop with `CheckPointID` is created → `GenResume` delivers the approval result to that exact interrupt point via `ResumeParams.Targets` (<SourceRef path="quickstart/chatwitheino/server/server.go:692" />) → the tool resumes from the breakpoint → the result streams back.
+- **`POST /abort`** (<SourceRef path="quickstart/chatwitheino/server/server.go:545" />): `loop.Stop(adk.WithImmediate())` cuts the current turn off immediately.
+
+`OnAgentEvents` is the key to this bridge (<SourceRef path="quickstart/chatwitheino/server/server.go:643" />): it hands the agent's internal async event stream, over a pair of channels, to the HTTP handler holding the SSE connection open; the handler streams to the browser as it receives, then sends the result (interrupted or not, the interrupt ID) back. **The TurnLoop owns "the agent's lifetime," the SSE handler owns "this one HTTP request," and the two are decoupled by channels** — a live specimen of Ch28's "channels as the scheduling seam."
+
+<Mermaid title="Human-approval loop: two HTTP requests spanning one interrupt" chart={`
+sequenceDiagram
+  participant U as Frontend
+  participant S as Server (TurnLoop)
+  participant A as Agent + RAG tool
+  participant CP as CheckPointStore
+  U->>S: POST /chat "summarize this doc"
+  S->>A: GenInput → run agent
+  A->>A: wants to call answer_from_document
+  A->>CP: StatefulInterrupt saves args
+  A-->>S: event: needs approval
+  S-->>U: SSE push "awaiting approval"
+  U->>S: POST /approve {approved:true}
+  S->>CP: load by CheckpointID
+  S->>A: GenResume delivers approval
+  A->>A: resume from breakpoint, run RAG
+  A-->>S: event: final answer
+  S-->>U: SSE push answer
+`} />
+
+## Memory: File-Based Sessions, Feeding the Model Only a Window
+
+Conversation history uses a JSONL-based `mem.Store`: each message is `Append`ed as a line (<SourceRef path="quickstart/chatwitheino/mem/store.go:82" />), persisting the whole history to disk. But what actually gets fed back to the agent is the history read by `GetMessages` plus a context prompt (<SourceRef path="quickstart/chatwitheino/mem/store.go:105" />). This confirms Ch08's view of memory: **persist everything, feed the model sparingly** — the disk holds complete JSONL, while each turn's `GenInput` stitches only the needed history into the input. Session state (the pending interrupt ID, the message cursor) also hangs off the session — that's exactly what makes "cross-request resume" possible.
+
+## From ch01 to the Full App: A Learning Ladder
+
+`chatwitheino` also thoughtfully leaves a ladder: `cmd/ch01`–`cmd/ch10` are ten rungs from "minimal runnable" to "complete app." `cmd/ch01/main.go` is just a few dozen lines — build a ChatModel, `Stream` once, loop over the deltas and print (<SourceRef path="quickstart/chatwitheino/cmd/ch01/main.go:38" />), a minimal reproduction of the streaming chapter in Part I. Climbing from ch01 up to the root — this full app with approval, memory, and SSE — you literally watch the book's mechanisms stack up one rung at a time. That's also our recommended starting point for hands-on work: **start by running ch01, and read your way up to main.go.**
+
+## Whole-Book Retrospective: Eino's Agent Design Philosophy
+
+Having read `chatwitheino`, it's the right moment to look back over the path we walked. What the book wants you to take away isn't an API list, but a few design convictions that thread through it all:
+
+1. **An Agent is a composition of "model + tools + middleware," not a special runtime.** (Part I / this chapter) `deep.NewTyped` stitches one RAG tool and a stack of handlers into a production-grade agent. Underneath is still that same compose engine.
+
+2. **Composition over inheritance; everything nests.** (Ch14 / Ch20 / last chapter) An entire RAG Workflow can be wrapped by `graphtool` into a tool; that tool is then mounted on the agent. The system grows by "nesting dolls," not by a giant class hierarchy.
+
+3. **Capability is injected as aspects, not intrusively.** (Ch10–11 / Ch26 / this chapter) Skills, approval, safe-tool, retry, observability are all middleware/callbacks wrapped on from the outside; business logic doesn't change a line. To add a capability, `append` a handler.
+
+4. **Control flows explicitly.** (Ch16–17 / this chapter) Whether to run a sensitive tool relies on no implicit magic — the decision is interrupted out to a human, and the approval result is delivered back to that exact interrupt point. Intent is data; resume is an ordinary call.
+
+5. **Interrupt-resume is an engine-level capability.** (Ch13 / Ch23 / this chapter) As long as state is serializable, any tool or graph can stop at any point, save, and resume later with feedback. HITL is therefore not a feature but a free byproduct.
+
+6. **Types are scaffolding; generics thread throughout.** (Ch20 / this chapter) `TypedAgent[M]`, `BaseModel[M]`, and the four execution paradigms make orchestration type-safe at compile time; `AgenticMessage` and plain `Message` adapt automatically through the same generic code.
+
+7. **Persistence is decoupled from the runtime.** (Ch08 / Ch23 / this chapter) Session history (JSONL) and interrupt saves (checkpoint) are two independent stores, injected into the server via interfaces — swapping storage is just swapping an implementation.
+
+If you remember only one sentence: **Eino polished "orchestration" into a first-class citizen, so an Agent no longer needs a special definition — it's just "model + tools + a stack of middleware," running in a loop that can pause and resume at will.** From Chapter 1's ADK worldview to this chapter's complete `chatwitheino` app, what you've been seeing all along is different projections of that same conviction.
+
+## Chapter Summary
+
+- `chatwitheino`'s skeleton is "one agent + one checkpoint store + one session store," injected into the server, then `Spin` starts the service (<SourceRef path="quickstart/chatwitheino/main.go:69" />).
+- `deep.NewTyped` stitches one RAG tool plus skill/approval/safe-tool middleware, plus model retry, into an agent like building blocks (<SourceRef path="quickstart/chatwitheino/agent.go:39" />) — capability is an appended aspect.
+- The approval middleware fits `answer_from_document` with a human gate using `tool.StatefulInterrupt` + `GetResumeContext` (<SourceRef path="quickstart/chatwitheino/agent.go:122" />), an application of engine-level interrupt-resume.
+- `TurnLoop` (<SourceRef path="quickstart/chatwitheino/server/server.go:570" />) uses three callbacks — `GenInput`/`OnAgentEvents`/`GenResume` — to span two HTTP requests (`/chat`, `/approve`) across one interrupt, forming an approval-capable, resumable SSE service.
+- Memory is file-based JSONL (<SourceRef path="quickstart/chatwitheino/mem/store.go:82" />): persist everything, feed the model only the needed window (<SourceRef path="quickstart/chatwitheino/mem/store.go:105" />).
+- `cmd/ch01`–`ch10` are a learning ladder from minimal streaming to the full app (<SourceRef path="quickstart/chatwitheino/cmd/ch01/main.go:38" />); start reading from ch01.
+- The design key: an Agent is not a special runtime but a composition of "model + tools + middleware" — the through-line of Eino's Agent design philosophy across the book.
+
+The next chapter is the book's finale: we step out of any specific app and look at how this entire Agent Runtime is **built on the native mechanisms of the Go language.**

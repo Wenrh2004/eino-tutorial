@@ -1,0 +1,157 @@
+## 同一个循环,两种世界观
+
+前一章你看到,ADK 里的一切——ReAct、多智能体、中断续跑——最终都编译成 compose 的**图**去跑。但"图"本身也有两种截然不同的执行方式。这一章我们钻进 compose 引擎最核心的那口"锅":同一段执行循环,如何靠替换一个组件,就在两种世界观之间切换?
+
+先给结论,后面逐段验证:compose 只有**一个** run 循环,但它接受两种"channel"策略——一种叫 **Pregel**(容忍环),一种叫 **DAG**(禁止环、会传播 skip)。你在 Part I/III 见过的 ReAct 循环之所以能有返回边,正因为它跑在 Pregel 模式下。
+
+<Mermaid title="一个逐轮推进的 run 循环 + 两种可替换的 channel 策略" chart={`
+flowchart TB
+  LOOP["唯一的 run 循环（逐轮推进）<br/>提交任务 → 等待完成 → 算下一批<br/>compose/graph_run.go"]
+  LOOP -->|"每轮询问 channel.get()"| CH{"channel 策略"}
+  CH --> PREGEL["Pregel channel<br/>任一上游到货即激活<br/>容忍环 · 有 maxSteps 上限"]
+  CH --> DAG["DAG channel<br/>全部依赖就绪才激活<br/>禁止环 · 传播 skip"]
+  PREGEL -.-> REACT["ReAct 返回边靠它"]
+`} />
+
+
+## 唯一的 run 循环
+
+整台引擎的心脏,是 `graph_run.go` 里那个 `runner.run`(<SourceRef path="compose/graph_run.go:109" />)。无论 Invoke 还是 Transform、无论 Pregel 还是 DAG,最终都汇进它。循环体本身极其规整(<SourceRef path="compose/graph_run.go:241" />):
+
+```go
+// Main execution loop.
+for step := 0; ; step++ {
+    // ...检查 ctx 取消
+    if !r.dag && step >= maxSteps {          // ← 唯一按模式分叉的地方之一
+        return nil, newGraphRunError(ErrExceedMaxSteps)
+    }
+    // 1. submit next tasks
+    // 2. get completed tasks
+    // 3. calculate next tasks
+    err = tm.submit(nextTasks)               // 提交本轮任务
+    // ...
+    completedTasks, canceled, canceledTasks := tm.wait()  // 等待完成
+    // ...calculateNextTasks 算出下一轮
+}
+```
+
+每一轮就干三件事:**提交任务 → 等待完成 → 算出下一批**。注意 `if !r.dag && step >= maxSteps` 这一行(<SourceRef path="compose/graph_run.go:249" />)——这是循环里少数几处显式看模式的地方:Pregel 模式(`!r.dag`)有最大轮数上限兜底(还记得第 14 章 ReAct 的 `MaxIterations=20` 吗?就是它),DAG 模式因为无环、不会无限跑,所以不设这个上限。
+
+<Callout kind="note" title="这个「一轮」有个学名:super-step">
+图计算的 Pregel 模型把这样的一轮叫 **super-step**:把计算切成一轮轮,每一轮里所有"就绪"的节点并行算一次,轮与轮之间同步一次。Eino 的这个 `for step` 循环就是它的实现——本章为了好读,后面一律叫它"轮"。理解这一点,下面"channel 决定谁就绪"才有意义——**循环负责推进轮次,channel 负责判断每个节点这一轮该不该被激活**。
+</Callout>
+
+## 切换语义的开关:channel 接口
+
+那么"谁该在这一轮激活"由谁决定?答案是每个节点前面挂着的一个 `channel`。它是一个接口(<SourceRef path="compose/graph_manager.go:29" />):
+
+```go
+type channel interface {
+    reportValues(map[string]any) error       // 上游送来一个值
+    reportDependencies([]string)             // 上游"我完成了"
+    reportSkip([]string) bool                // 上游"我这条路不走了"
+    get(bool, string, *edgeHandlerManager) (any, bool, error)  // 我这一轮就绪了吗?
+    // ...
+}
+```
+
+关键是 `get` 方法:循环每一轮都问每个 channel"你就绪了吗?"——**返回 true,对应节点就在这一轮被激活**。Pregel 和 DAG 的全部差异,几乎都浓缩在这个 `get` 的判断条件里。
+
+<Callout kind="key" title="本章的设计钥匙">
+compose 把"执行调度"和"就绪判断"**解耦**成了两层:上层是一个模式无关的逐轮循环(<SourceRef path="compose/graph_run.go:241" />),下层是一个可替换的 `channel` 策略(<SourceRef path="compose/graph_manager.go:29" />)。想换执行语义,不用改循环,只需换 channel 的实现。**"环 vs 无环"这个看似根本的区别,在架构上只是一次策略替换**——这正是"用组合代替分支"的设计哲学在引擎底层的体现:两种引擎不是两套代码,而是同一套循环 + 两种 channel。
+</Callout>
+
+## Pregel:任一上游到货就激活
+
+Pregel 的 channel 实现朴素得惊人(<SourceRef path="compose/pregel.go:25" />):
+
+```go
+type pregelChannel struct {
+    Values      map[string]any   // 上游送来的值,攒在这
+    mergeConfig FanInMergeConfig
+}
+```
+
+它的 `get` 判断只有一句话(<SourceRef path="compose/pregel.go:55" />):
+
+```go
+func (ch *pregelChannel) get(...) (any, bool, error) {
+    if len(ch.Values) == 0 {
+        return nil, false, nil    // 一个上游都还没到 → 不就绪
+    }
+    // ...只要有值就就绪
+}
+```
+
+**只要有任意一个上游送来了值,这个节点就在下一轮激活**——这就是 `AnyPredecessor`(任一前驱)语义(定义见 <SourceRef path="compose/types.go:42" />)。它对依赖不做任何记账:`reportSkip` 直接返回 `false`、`reportDependencies` 是空函数(<SourceRef path="compose/pregel.go:90" />)。
+
+正因为"任一上游到货即激活、且不追踪依赖是否齐全",Pregel 天然容忍**环**。ReAct 的 `AfterToolCalls → ChatModel` 那条返回边,在下一轮里给 ChatModel 的 channel 又送来一个值,它就又激活一次——循环于是转起来了,永不死锁。源码注释把这条设计写得很直白(<SourceRef path="compose/graph.go:42" />):"runTypePregel ... Can have cycles in graph."
+
+## DAG:所有上游齐活才激活,还要传播 skip
+
+DAG 的 channel 就复杂多了(<SourceRef path="compose/dag.go:50" />),因为它要记账:
+
+```go
+type dagChannel struct {
+    ControlPredecessors map[string]dependencyState  // 每个控制前驱:等待/就绪/跳过
+    Values              map[string]any
+    DataPredecessors    map[string]bool             // 每个数据前驱:是否到货
+    Skipped             bool
+    // ...
+}
+```
+
+它的 `get`(<SourceRef path="compose/dag.go:128" />)要求**所有前驱都有了交代**才就绪:
+
+```go
+for _, state := range ch.ControlPredecessors {
+    if state == dependencyStateWaiting {
+        return nil, false, nil    // 还有控制前驱在等 → 不就绪
+    }
+}
+for _, ready := range ch.DataPredecessors {
+    if !ready {
+        return nil, false, nil    // 还有数据前驱没到 → 不就绪
+    }
+}
+```
+
+这就是 `AllPredecessor`(所有前驱)语义(<SourceRef path="compose/types.go:45" />)。但这里冒出一个问题:如果图里有分支(branch),某条路没被选中,那条路上的节点永远不会"到货",下游岂不是永远等不齐?
+
+答案是 **skip 传播**。当一条分支不走时,它会 `reportSkip`(<SourceRef path="compose/dag.go:106" />)把自己标成"跳过";如果一个节点的**所有**控制前驱都被跳过了,它自己也被标记 `Skipped=true` 并返回 `true`——这个返回值触发 `channelManager.reportBranch`(<SourceRef path="compose/graph_manager.go:219" />)继续向下游级联,把"跳过"像涟漪一样传遍未选中的整条子图。于是"等齐所有前驱"和"分支"就能共存:没被选中的前驱不是"永远等",而是"明确地跳过"。
+
+<Callout kind="warning" title="为什么 DAG 必须无环">
+DAG 的 `get` 要求所有控制前驱脱离 `Waiting` 状态才激活。若图里有环,环上某个节点的前驱会永远停在 `Waiting`(它在等一个还没跑、而那个又在等它的节点)——直接死锁。所以 DAG 模式在编译期就用 `validateDAG`(<SourceRef path="compose/graph.go:1077" />)做一次拓扑检查,发现环就返回 `DAGInvalidLoopErr`(<SourceRef path="compose/graph.go:1129" />,报错文案"DAG is invalid, has loop")。**注意:禁止环这件事,不是 channel 自己拒绝的,而是编译期校验器提前拦下的**——channel 遇到环只会默默死锁。
+</Callout>
+
+## 谁来选模式
+
+最后一块拼图:引擎怎么知道该用哪种 channel?答案在编译期 `graph.compile`(<SourceRef path="compose/graph.go:679" />):
+
+```go
+// get run type
+runType := runTypePregel          // 默认 Pregel
+cb := pregelChannelBuilder
+// ...
+if (opt != nil && opt.nodeTriggerMode == AllPredecessor) || isWorkflow(g.cmp) {
+    runType = runTypeDAG          // 显式要求 AllPredecessor,或本身是 Workflow
+    cb = dagChannelBuilder
+}
+```
+
+**默认是 Pregel**;只有你显式指定 `AllPredecessor` 触发模式、或者你构建的是 `Workflow`(下一章讲),才切到 DAG。选定的 `cb`(channel builder)随后在 `initChannelManager`(<SourceRef path="compose/graph_run.go:948" />)里被用来给每个节点造 channel——同一段建造代码,只是喂进去的 builder 不同。这就是"一个循环、两种 channel"最干净的落地:模式选择只影响"用哪个 builder",循环本身一字不改。
+
+<Callout kind="tip" title="动手">
+打开 <SourceRef path="compose/pregel.go:55" /> 和 <SourceRef path="compose/dag.go:128" />,把两个 `get` 方法并排读一遍。用一句话概括它们的差异,再回想第 14 章的 ReAct 图——它为什么必须跑在 Pregel 模式?(提示:那条返回边。)然后想:如果你要搭一个"多个数据源并行拉取、全部到齐再汇总"的流程,你会选哪种模式?
+</Callout>
+
+## 本章小结
+
+- compose 只有**一个**逐轮循环 `runner.run`(<SourceRef path="compose/graph_run.go:241" />):每轮"提交→等待→算下一批",循环里几乎不看模式。
+- 语义切换靠可替换的 `channel` 策略(<SourceRef path="compose/graph_manager.go:29" />);核心是 `get`——决定每个节点这一轮是否就绪。
+- **Pregel**(<SourceRef path="compose/pregel.go:25" />):任一上游到货即激活(`AnyPredecessor`),不记账,**容忍环**——ReAct 返回边就靠它。
+- **DAG**(<SourceRef path="compose/dag.go:50" />):所有前驱齐活才激活(`AllPredecessor`),用 **skip 传播**(<SourceRef path="compose/dag.go:106" />)处理未选中的分支;**禁止环**由编译期 `validateDAG`(<SourceRef path="compose/graph.go:1077" />)拦截,而非 channel 自身。
+- 模式在编译期选定(<SourceRef path="compose/graph.go:679" />):默认 Pregel,`AllPredecessor` 或 `Workflow` 切 DAG;只换 builder,循环不变。
+- 设计钥匙:**执行调度与就绪判断解耦**,让"环 vs 无环"降格成一次策略替换。
+
+下一章我们上一层楼:看 `Graph`、`Chain`、`Workflow` 这三个面向用户的构建器,如何在同一个底层图上叠出不同的表达力,以及编译期的类型检查如何在你写错连线时当场报错。

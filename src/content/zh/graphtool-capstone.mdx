@@ -1,0 +1,106 @@
+## 收尾之始:让编排本身成为一件工具
+
+我们绕了一大圈。Part I 你学会了给 Agent 挂工具,Part IV 你拆开了 compose 引擎——现在把两者接起来:**一张编译好的 Graph / Chain / Workflow,能不能反过来变成 Agent 手里的一件工具?** 答案是能,而且这正是 Eino 分层设计最漂亮的一次自洽:**编排是工具的实现,工具是编排的封装。** 这一章我们读透 `graphtool` 这个官方示例(<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:32" />),看它如何把任意 compose 产物包成一件带中断能力的工具。
+
+<Mermaid title="Compilable 把三种编排包成一件工具" chart={`
+flowchart TB
+  G["Graph"] --> C{"Compilable 接口<br/>Compile() → Runnable"}
+  CH["Chain"] --> C
+  WF["Workflow"] --> C
+  C --> GT["InvokableGraphTool<br/>反射生成 ToolInfo(JSON Schema)"]
+  GT -->|"作为工具挂给 Agent"| AGENT["Agent"]
+  GT -.->|"每次调用现编译 + 私有 checkpoint"| INT["支持嵌套中断"]
+`} />
+
+
+## 一个接口,吃下三种构建器
+
+上一部分我们说 Graph / Chain / Workflow 共享同一个底座。这里就见到红利了。`graphtool` 只需要一个极窄的接口 `Compilable`(<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:32" />):
+
+```go
+type Compilable[I, O any] interface {
+    Compile(ctx context.Context, opts ...compose.GraphCompileOption) (compose.Runnable[I, O], error)
+}
+```
+
+`compose.Graph`、`compose.Chain`、`compose.Workflow` 三者都实现了 `Compile`——所以它们**天然都是 `Compilable`**。包装器不需要关心你用的是哪一种编排,只认"能编译成 Runnable"这一件事。这就是"面向接口而非实现"在框架层的一次干净兑现。
+
+包装器本体是 `InvokableGraphTool`(<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:36" />),字段朴素得很:
+
+```go
+type InvokableGraphTool[I, O any] struct {
+    compilable     Compilable[I, O]              // 待编译的编排
+    compileOptions []compose.GraphCompileOption  // 编译选项
+    tInfo          *schema.ToolInfo              // 工具的 schema
+}
+```
+
+构造时(<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:42" />)有一个关键动作:`utils.GoStruct2ToolInfo[I](name, desc)`——它用反射把输入类型 `I` 这个 Go struct **自动翻译成工具的 JSON Schema**。你定义好输入结构体,工具的参数描述就自动生成了,大模型据此知道该怎么填参。注意:**这里并不编译图**,编译被推迟到每次调用时。
+
+## Invoke:把工具调用翻译成一次图执行
+
+`InvokableRun`(<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:77" />)是整个适配的心脏。它做的事,本质是"翻译":把大模型给的 JSON 字符串参数,翻译成图的类型化输入;把图的输出,翻译回 JSON 字符串。
+
+```go
+func (g *InvokableGraphTool[I, O]) InvokableRun(ctx context.Context, input string,
+    opts ...tool.Option) (output string, err error) {
+    // 1. 取出调用选项,并强制挂上一个固定的 checkpoint id
+    callOpts := tool.GetImplSpecificOptions(&graphToolOptions{}, opts...).composeOpts
+    callOpts = append(callOpts, compose.WithCheckPointID(graphToolCheckPointID))
+    // 2. 每次调用都新鲜编译一次图(带一个私有的 checkpoint store)
+    // 3. 把 JSON 参数 Unmarshal 进类型化的 I
+    // 4. runnable.Invoke(ctx, inputParams, callOpts...) 真正跑图
+    // 5. 把输出 MarshalString 成 JSON 字符串返回
+}
+```
+
+有个反直觉的细节:**图是每次调用现编译的**(<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:88" />附近),不是构造时编一次复用。为什么?因为要给每次调用塞一个**私有的、单槽的 checkpoint store**——这是它承载中断的关键,我们马上讲。这是一个清醒的取舍:牺牲一点编译开销,换来干净的中断隔离。
+
+<Callout kind="key" title="本章的设计钥匙">
+GraphTool 兑现了 Eino 分层的"闭环":**compose 是 ADK 工具的实现底座,而工具又是 compose 编排的对外封装**——两层互为表里,靠 `Compilable` 这一个极窄接口咬合。更精妙的是它对**中断的三层接力**:内层图用 `StatefulInterrupt` 抛出中断,GraphTool 把内层的 checkpoint 字节**打包进自己的工具中断状态**再向上抛,ToolsNode 再带上工具地址继续上抛给 Agent Runner。每一层只认自己那一层的状态类型(靠泛型 `GetInterruptState[T]` 天然隔离),于是"工具里嵌了一张会中断的图,图里的节点又要人工审批"这种两层甚至多层嵌套中断,才能被逐层精确地保存与恢复。这正是"中断是一等公民"从 Agent 一路贯通到编排引擎的证明。
+</Callout>
+
+## 中断的三层接力:嵌套中断如何被逐层保存
+
+这是本章最硬的机制,也是 GraphTool 存在的真正理由。设想一个场景:Agent 调了一个"订单审批工具",这工具内部是一张 Workflow,Workflow 里有个节点需要人工确认。这里有两层中断——外层工具的审批、内层图节点的确认。它们怎么互不干扰地被保存和恢复?
+
+**第一层:内层图抛中断。** 图里的节点用 `compose.StatefulInterrupt(ctx, info, state)` 抛出中断,把自己的局部状态一并带走。这是 Part III 讲过的图引擎中断原语。
+
+**第二层:GraphTool 捕获并重新打包。** 图 `Invoke` 返回中断错误后,`InvokableRun` 用 `compose.ExtractInterruptInfo(err)` 识别它(<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:121" />),然后从那个私有 store 里取出内层图的 checkpoint 字节,用 `tool.CompositeInterrupt` 重新抛出(<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:134" />):
+
+```go
+return tool.CompositeInterrupt(ctx, "graph tool interrupt",
+    &graphToolInterruptState{Data: data, ToolInput: input},  // 内层 checkpoint + 原始参数
+    interruptErr)
+```
+
+注意这个 `graphToolInterruptState`(<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:68" />)——它把**内层图的 checkpoint 字节**和**原始工具参数**一起,变成 GraphTool 自己这一层的中断状态。内层图的中断,就这样被"提升"进了外层 Agent 的 checkpoint。承载它的是一个私有的单槽 store(<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:303" />),内层图从不直接触碰 Agent 的真 store。
+
+**第三层:ToolsNode 带地址上抛。** compose 的 `ToolsNode` 在每个工具调用外面套一层地址段,识别到工具的中断后,用工具的 callID 作地址把它包起来,最终作为一个可恢复点交给 Agent Runner。
+
+三层各自只序列化自己那一层,恢复时反向逐层解包。**关键在于类型隔离**:外层审批包装器的中断状态是 `string`,GraphTool 的是 `*graphToolInterruptState`,而 `tool.GetInterruptState[T]` 是泛型的——每一层只会取到类型匹配的那一份状态,天然互不串味。这就是为什么四号示例里"外层审批 + 内层图中断"能被顺序、精确地各自恢复。
+
+## 四种编排,四种工具形态
+
+官方示例给了四个递进的样例,正好覆盖 Part IV 的三个构建器 + 嵌套中断:
+
+<Callout kind="note" title="四个示例的映射">
+- **Chain 做摘要工具**:`InvokableGraphTool` 包一条线性 Chain,最简形态。
+- **Graph 做并行研究**:`StreamableGraphTool` 包一张并行 fan-out 的 Graph,配 `ReturnDirectly` 让流式结果直达用户。
+- **Workflow 做订单审批**:`InvokableGraphTool` 包一张带字段映射的 Workflow,再用审批包装器套一层。
+- **两层嵌套中断**:审批包装器(状态是 `string`)套在 GraphTool(状态是 `*graphToolInterruptState`)外面,演示双层中断的顺序恢复。
+
+四个样例共享同一个 `graph_tool.go`,只是喂进去的 `Compilable` 不同——再次印证"一个底座长出多种表达力"。
+</Callout>
+
+流式版 `StreamableGraphTool` 的 `StreamableRun` 结构也值得一提:它立刻返回一个 `schema.Pipe[string](1)` 的 reader,把真正的工作丢进 goroutine,逐块 `MarshalString` 后 `Send`;中断既可能在流开始前冒出来,也可能在流中途 `Recv` 时冒出来,两处都做了同样的捕获-重包装。这样"流式工具"才能既边吐边给用户看,又能在任意时刻被中断保存。
+
+## 本章小结
+
+- GraphTool 用一个极窄接口 `Compilable`(<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:32" />)吃下 Graph/Chain/Workflow 三种编排,**编排即工具实现,工具即编排封装**。
+- 构造时 `GoStruct2ToolInfo` 用反射把输入 struct 自动变成工具 JSON Schema;图**每次调用现编译**(<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:77" />),以便注入私有 checkpoint store。
+- `InvokableRun` 的本质是"JSON 参数 ↔ 类型化输入/输出"的双向翻译,外加一次 `runnable.Invoke`。
+- **嵌套中断三层接力**:内层图 `StatefulInterrupt` → GraphTool 用 `CompositeInterrupt` 把内层 checkpoint 打包进 `graphToolInterruptState`(<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:134" />)→ ToolsNode 带地址上抛;靠泛型 `GetInterruptState[T]` 做类型隔离,多层互不串味。
+- 设计钥匙:这一章是全书分层设计的"闭环证明"——ADK、compose、components 三层不是单向依赖,而是能互相封装、互相成就。
+
+下一章我们做一个真正端到端的 Capstone:把索引、检索、ReAct、记忆、Web UI 拼成一个完整的 RAG 助手,看这些机制在真实应用里如何咬合。

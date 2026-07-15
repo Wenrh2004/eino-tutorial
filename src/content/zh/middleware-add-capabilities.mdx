@@ -1,0 +1,126 @@
+## 不改核心,给 Agent 叠能力
+
+前五章的 Agent 已经会用模型、调工具、记忆、中断续跑。但真实项目里,你还会不断冒出新需求:让它能读写文件、能把超长历史自动压缩、能先规划任务再执行、能动态检索该用哪个工具……
+
+如果每来一个需求就去改 `ChatModelAgent` 的核心逻辑,这个类会迅速膨胀成谁都不敢碰的怪物。Eino 的答案是**中间件**:核心保持不变,能力像叠罗汉一样一层层叠上去。
+
+先感受一下叠加的样子:
+
+```go
+agent, _ := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+    Name:        "coder",
+    Instruction: "你是一名工程师,可以读写文件、规划任务。",
+    Model:       chatModel,
+    Handlers: []adk.ChatModelAgentMiddleware{
+        filesystemMW,     // 叠加:文件系统工具
+        plantaskMW,       // 叠加:任务规划
+        summarizationMW,  // 叠加:超长历史自动摘要
+    },
+})
+```
+
+核心的 Agent 一行没改,三种能力却都长上去了。这一章拆开这套「叠加」机制。
+
+<Mermaid title="核心不变,能力一层层叠上去" chart={`
+flowchart TB
+  REQ["一次运行"] --> S["summarizationMW<br/>超长历史自动摘要"]
+  S --> P["plantaskMW<br/>任务规划"]
+  P --> F["filesystemMW<br/>文件系统工具"]
+  F --> CORE["ChatModelAgent 核心<br/>（一行未改）"]
+  CORE --> F
+  F --> P
+  P --> S
+`} />
+
+
+## 中间件是什么:九个钩子
+
+现代中间件接口是 `TypedChatModelAgentMiddleware[M]`(<SourceRef path="adk/handler.go:139" />),默认别名 `ChatModelAgentMiddleware`(<SourceRef path="adk/handler.go:259" />)。它不是一个笼统的 `Handle()`,而是把 Agent 一轮运行里的**九个关键时刻**都开了口子:
+
+```go
+type TypedChatModelAgentMiddleware[M MessageType] interface {
+    // Agent 级:进入/退出
+    BeforeAgent(...)              // 改指令、改工具集
+    AfterAgent(...)              // 成功收尾时观测
+
+    // 模型级:每次调模型前后(状态会被持久化)
+    BeforeModelRewriteState(...)  // 改消息、改工具列表——推荐在这里改
+    AfterModelRewriteState(...)   // 拿到模型回复后加工
+
+    // 工具级:包裹一次工具执行
+    WrapInvokableToolCall(...)    // 同步工具
+    WrapStreamableToolCall(...)   // 流式工具
+    WrapEnhancedInvokableToolCall(...)   // 增强版同步
+    WrapEnhancedStreamableToolCall(...)  // 增强版流式
+
+    // 模型调用级:包裹模型本身
+    WrapModel(...)               // 重试、降级、改温度、发进度事件
+}
+```
+
+钩子的命名暴露了设计意图。带 `Before/After` 的是**观测与改写点**;带 `Wrap` 的是**包裹点**——它给你原始的执行端点(endpoint),你返回一个包了一层的新端点。`Wrap` 系列正是"洋葱模型"的体现:你的逻辑裹在真正的调用外面,调用前后你都能插手。
+
+<Callout kind="note" title="改消息去 BeforeModelRewriteState,不要去 WrapModel">
+源码在 `WrapModel` 的注释里明确劝退:不要在 `WrapModel` 里改输入消息。原因有二——(1)`WrapModel` 的改动**不会被持久化进 state**,只影响单次模型调用;(2)它会**打断 prompt 缓存**。要改消息或工具列表,请用 `BeforeModelRewriteState`(<SourceRef path="adk/handler.go:171" />),那里的改动才是状态的真相来源。`WrapModel`(<SourceRef path="adk/handler.go:254" />)只该做"围绕模型调用本身"的事:重试、故障切换、改温度、发流式进度。
+</Callout>
+
+## 只写你关心的钩子
+
+九个钩子听着吓人,但你几乎不会全部实现。诀窍是**内嵌** `TypedBaseChatModelAgentMiddleware[M]`(<SourceRef path="adk/handler.go:261" />),它为九个方法都提供了空操作(no-op)默认实现:
+
+```go
+type LoggingMW struct {
+    *adk.BaseChatModelAgentMiddleware // 内嵌:白拿八个 no-op 默认实现
+}
+
+// 只覆写你真正关心的那一个
+func (m *LoggingMW) BeforeModelRewriteState(
+    ctx context.Context,
+    state *adk.ChatModelAgentState,
+    mc *adk.ModelContext,
+) (context.Context, *adk.ChatModelAgentState, error) {
+    log.Printf("即将调用模型,历史长度=%d", len(state.Messages))
+    return ctx, state, nil
+}
+```
+
+内嵌之后,`LoggingMW` 自动满足整个接口,你只需写那一个真正有逻辑的方法。这是 Go 里"接口默认实现"的惯用法,ADK 用它把中间件的编写成本压到最低。
+
+<Callout kind="key" title="本章的设计钥匙">
+中间件的本质是**用组合替代修改**。核心 `ChatModelAgent` 对所有能力一无所知,它只在九个固定时刻回调钩子;能力则被拆成一个个独立、可插拔、可复用的中间件。这带来三个直接好处:核心稳定(加能力不改核心)、能力正交(文件系统与摘要互不知晓)、顺序即语义(叠加的先后决定包裹的内外)。这正是"开闭原则"在 Agent 运行时里的落地——对扩展开放,对修改封闭。
+</Callout>
+
+## 顺序即语义:谁先注册,谁在最外层
+
+多个中间件叠在一起,顺序不是无所谓的。对 `Wrap` 系列的包裹钩子而言:**先注册的中间件在最外层**。也就是说,请求进来时先经过它,响应出去时最后经过它——标准的洋葱模型。
+
+这里还有一条历史包袱要知道:除了新的 `Handlers`(接口切片),Config 里还有一个已废弃的 `Middlewares` 结构体字段。执行顺序上,**老的 `Middlewares` 整体先于新的 `Handlers`** 运行。新代码只用 `Handlers` 即可,遇到老代码时记得这条优先级。
+
+跨中间件传数据也有专门通道:`SetRunLocalValue`(<SourceRef path="adk/handler.go:338" />)/ `GetRunLocalValue`(<SourceRef path="adk/handler.go:366" />)。它们把值绑定到"当前这一次 Run",而且——注意——**能安全穿越中断/续跑**:值会被序列化进 checkpoint,恢复时原样还原。这让中间件的状态与第 5 章的 HITL 机制天然兼容。
+
+## 内置中间件速览:能力工具箱
+
+ADK 在 `adk/middlewares/` 下自带了一批开箱即用的中间件,每个都遵循同样的构造范式(泛型版 `NewTyped[M]` + 默认版 `New`)。挑几个高频的:
+
+- **filesystem**(<SourceRef path="adk/middlewares/filesystem/filesystem.go:395" />):给 Agent 一整套文件操作工具——ls / read / write / edit / glob / grep,还能把过大的结果转存、避免撑爆上下文。让 Agent 能"在项目里干活"的基础件。
+- **plantask**:注入 TaskCreate / Get / Update / List 一组任务管理工具,让 Agent 先把大任务拆成清单、逐条推进。复杂多步任务的骨架。
+- **summarization**:当历史超过阈值(约 16 万 token)时自动摘要压缩,把长对话塞回上下文窗口。长会话的续命件。
+- **skill**:加载 `SKILL.md` 定义的技能,支持 inline / fork / fork_with_context 三种执行模式。把可复用的"工作流"注入 Agent。
+- **toolsearch**:注入一个 `tool_search` 元工具,让 Agent 在成百上千个工具里**动态检索**该用哪个,而不是一次性把全部工具塞给模型。
+
+<Callout kind="note" title="过时提示:NewMiddleware vs New">
+你可能在老代码里见到 `NewMiddleware`(如 <SourceRef path="adk/middlewares/filesystem/filesystem.go:173" />),它返回旧的 `AgentMiddleware`,已被标注废弃。新代码请用 `New`,它返回现代的 `ChatModelAgentMiddleware`,通过 `Wrap` 钩子提供更好的上下文传播。两者能力相近,区别在接口世代。
+</Callout>
+
+这些内置件本身就是最好的教材——想深入某个能力时,直接读它的中间件源码,九个钩子怎么用、状态怎么传、事件怎么发,一目了然。Part II 第 10 章会回到中间件的**设计**层面,讲清这套钩子为何这样切、内置件如何分类。这里你只需建立"叠加"的心智。
+
+## 本章小结
+
+- 中间件让你**不改核心、只叠能力**:核心在九个固定时刻回调钩子,能力被拆成可插拔的独立件。
+- 九个钩子分三级:Agent 级(`Before/AfterAgent`)、模型级(`Before/AfterModelRewriteState`,改动会持久化)、包裹级(`Wrap*`,洋葱模型)。
+- 改消息用 `BeforeModelRewriteState`;`WrapModel` 只做重试/降级/发事件,别在里面改输入。
+- 内嵌 `BaseChatModelAgentMiddleware` 白拿 no-op 默认实现,只写你关心的钩子。
+- 顺序即语义(先注册=最外层);老 `Middlewares` 先于新 `Handlers`;跨件传值用 `SetRunLocalValue`/`GetRunLocalValue`,可穿越中断续跑。
+- 内置 filesystem / plantask / summarization / skill / toolsearch 是能力工具箱,也是学习范例。
+
+下一章,我们把单 Agent 升级为**多智能体**:先跑通 supervisor 与 DeepAgent 两条路线,亲手体验两种组合哲学的差别。

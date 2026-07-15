@@ -1,0 +1,151 @@
+## 最小可跑的第一个 Agent
+
+`ChatModelAgent` 是 ADK 里最常用的 Agent 类型:给它一个模型、一段指令,它就能对话;再给它工具,它就能自动进入「思考—调用工具—再思考」的 ReAct 循环(第 14 章会拆解这个循环)。先看最小形态——只有模型和指令,没有工具:
+
+```go
+agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+    Name:        "assistant",
+    Description: "一个通用助手",
+    Instruction: "你是一个乐于助人的中文助手。",
+    Model:       chatModel, // 来自 eino-ext,如 openai.NewChatModel(...)
+})
+if err != nil {
+    return err
+}
+
+runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: agent})
+iter := runner.Query(ctx, "用一句话解释什么是事件溯源")
+for {
+    event, ok := iter.Next()
+    if !ok {
+        break
+    }
+    msg, _, err := adk.GetMessage(event)
+    if err != nil || msg == nil {
+        continue
+    }
+    fmt.Print(msg.Content)
+}
+```
+
+跑起来就这么多。下面把每个关键点对着源码讲清楚。
+
+<Mermaid title="Runner.Query 到事件流的一次调用" chart={`
+sequenceDiagram
+  participant U as 调用方
+  participant R as Runner
+  participant A as ChatModelAgent
+  participant M as ChatModel
+  U->>R: Query(ctx, "问题")
+  R->>A: Run(ctx, input)
+  A->>M: Generate / Stream(messages)
+  M-->>A: 消息（可能带 ToolCalls）
+  A-->>R: AsyncIterator[*AgentEvent]
+  loop iter.Next()
+    R-->>U: event（Output / Action / Err）
+  end
+`} />
+
+
+## Config:一个 Agent 的全部配置
+
+`ChatModelAgentConfig`(<SourceRef path="adk/chatmodel.go:260" />)是 `TypedChatModelAgentConfig[*schema.Message]` 的别名。它的字段决定了这个 Agent 的一切能力,先记住最核心的几个:
+
+| 字段 | 类型 | 作用 |
+| --- | --- | --- |
+| `Name` | `string` | Agent 名字,会出现在事件的 `AgentName` 里 |
+| `Description` | `string` | 描述;被当作工具/子 Agent 时,这就是它的「工具说明」 |
+| `Instruction` | `string` | 系统提示,支持 `{占位符}` 注入 session 值(第 4 章) |
+| `Model` | `model.BaseModel[M]` | 大模型;**若要用工具,模型必须支持 `model.WithTools`** |
+| `ToolsConfig` | `ToolsConfig` | 工具配置(第 3 章) |
+| `MaxIterations` | `int` | ReAct 循环上限,默认 20(<SourceRef path="adk/chatmodel.go:308" />) |
+| `Exit` | `tool.BaseTool` | 可选的退出工具;为 nil 时不生成 Exit 动作 |
+| `OutputKey` | `string` | 把最终输出写回 session 的键名 |
+
+<Callout kind="note" title="Description 不是给人看的注释">
+`Description` 看起来像文档字符串,但在多智能体场景里它有实打实的功能:当这个 Agent 被 `NewAgentTool` 包装成工具时(第 7、16 章),`Description` 就是模型看到的「这个工具能干什么」。写得含糊,上层模型就不知道该不该调用它。
+</Callout>
+
+构造函数 `NewChatModelAgent`(<SourceRef path="adk/chatmodel.go:484" />)会做基本校验:`Model` 为 nil 直接报错;`GenModelInput` 为 nil 时填入默认实现(负责把 `Instruction` + 历史消息拼成模型输入,第 4 章详述)。
+
+## Run vs Query:两个入口
+
+`Runner` 有两个跑法,区别只在「输入形态」:
+
+`Query`(<SourceRef path="adk/runner.go:108" />)接受一个字符串,内部包成一条 user 消息:
+
+```go
+func (r *TypedRunner[M]) Query(ctx context.Context, query string,
+    opts ...AgentRunOption) *AsyncIterator[*TypedAgentEvent[M]] {
+    msgs, err := newUserMessage[M](query)
+    if err != nil {
+        return errorIterator[M](err)
+    }
+    return r.Run(ctx, []M{msgs}, opts...)
+}
+```
+
+`Run`(<SourceRef path="adk/runner.go:102" />)接受一个消息切片 `[]M`,适合你已经有多轮历史、或要塞入 system/assistant 消息的场景:
+
+```go
+iter := runner.Run(ctx, []*schema.Message{
+    schema.SystemMessage("只用 JSON 回答"),
+    schema.UserMessage("列出三种一致性模型"),
+})
+```
+
+两者返回的都是同一个 `*AsyncIterator[*TypedAgentEvent[M]]`。记住:**`Query` 只是 `Run` 的单字符串语法糖**,没有任何行为差异。
+
+## 消费事件流:Next 循环与 GetMessage
+
+事件流的消费永远是同一个模式——`Next()` 循环直到 `ok == false`:
+
+```go
+for {
+    event, ok := iter.Next()
+    if !ok {
+        break
+    }
+    // ...
+}
+```
+
+`AsyncIterator` 底层是一个无界 channel(<SourceRef path="adk/utils.go:31" />),`Next()` 从里面收事件,第二个返回值告诉你流是否已耗尽(<SourceRef path="adk/utils.go:35" />)。
+
+但事件里的输出可能是**流式**的(`Output.MessageOutput.IsStreaming == true`),这时 `Message` 字段是空的,内容藏在一个 `MessageStream` 里。手动处理这两种情况很啰嗦,所以 ADK 给了 `GetMessage`(<SourceRef path="adk/utils.go:300" />):
+
+```go
+msg, newEvent, err := adk.GetMessage(event)
+```
+
+它会:非流式时直接取 `Message`;流式时**复制一份流**(`Copy(2)`)、拼接成完整消息返回,同时把原事件里的流替换成一个仍可消费的副本(所以返回了一个 `newEvent`)。这样你既拿到了完整文本,又没有「消费掉别人还要用的流」。
+
+<Callout kind="key" title="本章的设计钥匙">
+「流」在 Eino 里是一等公民,但流有个天然陷阱:**一份流只能被读一次**。ADK 的做法是——凡是需要「窥视」流内容的地方,都先 `Copy` 再读,读完把原位置换成一个新的、未被消费的流。`GetMessage` 就是这个原则的门面。你在第 21 章会看到底层 `StreamReader` 的 copy-on-read 实现。
+</Callout>
+
+## EnableStreaming 到底开关了什么
+
+新手常以为 `EnableStreaming` 是「要不要流式打字机效果」的 UI 开关。其实它更底层:它决定 ChatModelAgent 内部对编译好的图调用的是 `Stream` 还是 `Invoke`(<SourceRef path="adk/chatmodel.go:1202" />):
+
+```go
+if mp.input.EnableStreaming {
+    msgStream, err_ = runnable.Stream(ctx, in, runOpts...)
+} else {
+    msg, err_ = runnable.Invoke(ctx, in, runOpts...)
+}
+```
+
+它是 `RunnerConfig` 上的字段(<SourceRef path="adk/runner.go:68" />),Runner 会把它盖进每一个 `AgentInput`。开了它,事件里的 `Output` 就是流式的,你需要用 `GetMessage` 或手动读 `MessageStream`;关了它,`Message` 直接就是完整消息。
+
+一个容易忽略的细节:**续跑(Resume)时的流式模式来自 checkpoint,而不是调用方**(<SourceRef path="adk/runner.go:124" />)。也就是说,你中断时是流式的,恢复时也会是流式的——状态里记着呢。这是「中断/续跑要忠实还原当时上下文」的一个具体体现,第 5 章会正面讲中断。
+
+## 本章小结
+
+- `ChatModelAgent` 是最常用的 Agent:模型 + 指令即可对话,加工具即进入 ReAct 循环。
+- `Config` 里 `Name` / `Description` / `Instruction` / `Model` 是四个必知字段;`Description` 在多智能体里是「工具说明」。
+- `Query` 是 `Run` 的单字符串语法糖,二者返回同一种事件流。
+- 消费事件永远用 `for { Next() }`;用 `GetMessage` 安全地处理流式/非流式两种输出。
+- `EnableStreaming` 决定内部走 `Stream` 还是 `Invoke`;续跑时的流式模式由 checkpoint 决定。
+
+下一章,我们给这个 Agent 装上工具,看清 `ToolInfo` / `InvokableTool` 的契约,以及「工具绑定为什么是不可变的」。

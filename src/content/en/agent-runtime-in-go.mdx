@@ -1,0 +1,201 @@
+## The finale: why this agent runtime is *Go's*
+
+Having come this far, you've pried Eino apart all the way from the outermost ADK down to the innermost compose engine. In this last chapter we introduce no new mechanism; instead we step back and ask a question that runs through the whole book:
+
+**Why is Eino written in Go, rather than "happening to be written in Go"?**
+
+Many frameworks, rewritten in another language, keep the same skeleton. Eino doesn't — its parallel scheduling, cancel propagation, type-safety, and persistence, nearly every key design, **grow directly on Go's native mechanisms**: goroutine + channel, `context.Context`, generics, interfaces, `encoding/gob`. This chapter names each of these five "language pillars" so you can see clearly: Eino isn't "an agent framework implemented in Go," it's "an agent runtime whose bedrock is Go's concurrency model."
+
+<Mermaid title="The five native-Go pillars of the agent runtime" chart={`
+flowchart TB
+  subgraph RT["Eino Agent Runtime"]
+    SCHED["parallel scheduling<br/>one goroutine per parallel node<br/>compose/graph_manager.go"]
+    CANCEL["cancel propagation<br/>context.Context threaded through<br/>adk/turn_loop.go"]
+    TYPE["type-safety<br/>generic TypedAgent[M] / BaseModel[M]<br/>adk · components/model"]
+    SEAM["composition seam<br/>interfaces Runnable / Agent<br/>compose/runnable.go"]
+    PERSIST["native persistence<br/>encoding/gob<br/>schema/serialization.go"]
+  end
+  GO1["goroutine + UnboundedChan"] --> SCHED
+  GO2["context.Context"] --> CANCEL
+  GO3["Go generics"] --> TYPE
+  GO4["interface"] --> SEAM
+  GO5["encoding/gob"] --> PERSIST
+`} />
+
+## Pillar one: parallelism = one goroutine per node
+
+Chapter 22 showed you the "data plane" of fan-out/fan-in; here we look at its "scheduling plane." When a super-step has several nodes to run, `taskManager.submit` (<SourceRef path="compose/graph_manager.go:300" />) is reassuringly plain — **it spawns one goroutine per parallel task**:
+
+```go
+func (t *taskManager) submit(tasks []*task) error {
+    // ...pre-handler
+    var syncTask *task
+    if t.num == 0 && (len(tasks) == 1 || t.needAll) && t.cancelCh == nil {
+        syncTask = tasks[0]        // optimization: a single, non-interruptible task runs in the current goroutine
+        tasks = tasks[1:]
+    }
+    for _, currentTask := range tasks {
+        t.num += 1
+        go t.execute(currentTask)  // <- each remaining task gets a goroutine
+    }
+    if syncTask != nil {
+        t.num += 1
+        t.execute(syncTask)        // the sync task runs in this goroutine, saving one scheduling hop
+    }
+    return nil
+}
+```
+
+No thread pool, no worker queue, no elaborate scheduler — because Go's goroutine is itself a "cheap unit of concurrency," and the runtime has already done the M:N scheduling for you. The framework need only say `go`, leaving the rest to the language. That's the first sense of "use the language's native mechanism": **concurrency that can be expressed with goroutines shouldn't get a hand-rolled scheduler**.
+
+So how are finished goroutines' results collected? `execute` sends the task (along with panic recovery) into a `done` channel in a `defer` (<SourceRef path="compose/graph_manager.go:285" />), and that channel is a home-grown `UnboundedChan` (<SourceRef path="internal/channel.go:22" />):
+
+```go
+type UnboundedChan[T any] struct {
+    buffer   []T
+    mutex    sync.Mutex
+    notEmpty *sync.Cond   // a condition variable, not a fixed-capacity channel
+    closed   bool
+}
+```
+
+Why not a native `chan`? Because a native channel has a fixed capacity: full means the sender blocks. But the number of parallel tasks in a super-step is unknown, and with a bounded channel a fast-finishing goroutine could be blocked by a slow consumer, even deadlocking. `UnboundedChan` uses `sync.Cond` + a slice to make an **unbounded buffer**: `Send` never blocks, `Receive` suspends on the condition variable when empty. **This is a "top-up" over Go's native mechanism — the language gives you channel and Cond as two bricks, and the framework assembles the one it needs.**
+
+<Callout kind="note" title="Goroutines are cheap, but not free">
+"One goroutine per node" is viable because a goroutine's initial stack is just 2KB and the runtime multiplexes OS threads. But that doesn't mean you can spawn infinitely — a graph with thousands of parallel nodes still creates scheduling and memory pressure. Eino's trade-off is to set the concurrency granularity at the "graph node" level (rather than finer, per-chunk), capturing the parallelism benefit while keeping the goroutine count on the same order as the graph size and thus controllable.
+</Callout>
+
+## Pillar two: cancel = context.Context threaded end to end
+
+In Chapter 17 you saw the goroutine in `TurnLoop.run` that watches for cancellation. Now revisit it at the height of a "language pillar" (<SourceRef path="adk/turn_loop.go:1570" />):
+
+```go
+func (l *TurnLoop[T, M]) run(ctx context.Context) {
+    // ...
+    go func() {
+        select {
+        case <-ctx.Done():      // <- external cancel, coming from context.Context
+            l.buffer.Close()    // translated into: close the internal buffer
+        case <-l.done:
+        }
+    }()
+    // ...
+}
+```
+
+The cancel signal isn't a broadcast mechanism Eino invented, but is **built directly on `context.Context`**. That yields three free benefits:
+
+1. **Automatic downward propagation**: cancel a parent `ctx` and all derived `ctx`s cancel together — in nested multi-agent runs, cancelling the root agent cascades into sub-agents inside AgentTools (Chapter 16 covered why Interrupted propagates while Exit/Transfer are absorbed).
+2. **Unified with timeout/deadline**: `context.WithTimeout` and manual cancel travel the same `Done()` channel, so the framework needn't distinguish "timeout vs user cancel."
+3. **Cleanup on cancel**: `runContext` (Chapter 17), hung on `ctx`, is reclaimed together on cancel, leaving no dangling state.
+
+And "cancel precise to a safe-point" (Chapter 17's `CancelMode` bitmask) is a finer layer of control laid over this `ctx` trunk. **The base is the language's `context.Context`; the framework only adds a "where to stop" granularity on top** — another instance of "don't reinvent the wheel."
+
+## Pillar three: type-safety = carried by generics, backstopped at compile time
+
+Eino's most conspicuous modernization is going fully generic. The `TypedAgent[M]` (<SourceRef path="adk/interface.go:453" />) you met in Chapters 8 and 12 uses a single type parameter `M` to express both "I handle plain messages" and "I handle agentic messages":
+
+```go
+type TypedAgent[M MessageType] interface {
+    Name(ctx context.Context) string
+    Description(ctx context.Context) string
+    Run(ctx context.Context, input *TypedAgentInput[M], options ...AgentRunOption) *AsyncIterator[*TypedAgentEvent[M]]
+}
+type Agent = TypedAgent[*schema.Message]   // an alias for existing code, zero migration cost
+```
+
+The same technique runs down to the base model layer, `BaseModel[M]` (<SourceRef path="components/model/interface.go:36" />):
+
+```go
+type BaseModel[M messageType] interface {
+    Generate(ctx context.Context, input []M, opts ...Option) (M, error)
+    Stream(ctx context.Context, input []M, opts ...Option) (*schema.StreamReader[M], error)
+}
+type BaseChatModel = BaseModel[*schema.Message]  // an alias kept likewise
+```
+
+Generics do two non-conflicting things here: **inward**, the `chat` and `agentic` message systems reuse the same interfaces and orchestration code without duplication; **outward**, through aliases like `type Agent = TypedAgent[*schema.Message]`, existing users' code doesn't change a line. That's the value of "generics carrying type-safety" — it condenses the "multiple message types" variation point into one type parameter, rather than scattering it into a pile of `interface{}` + runtime assertions. In Chapter 20 you also saw the compose layer use `reflect.Type` to validate wiring at compile time — the same "bring errors forward to compile time" philosophy, extended to the orchestration layer.
+
+## Pillar four: composition = interfaces as seams
+
+If generics govern "type correctness," interfaces govern "can these be plugged together." All of Eino's composability rests on a few key interfaces acting as "seams." The most central is `Runnable` (<SourceRef path="compose/runnable.go:32" />):
+
+```go
+type Runnable[I, O any] interface {
+    Invoke(ctx context.Context, input I, opts ...Option) (output O, err error)
+    Stream(ctx context.Context, input I, opts ...Option) (output *schema.StreamReader[O], err error)
+    Collect(ctx context.Context, input *schema.StreamReader[I], opts ...Option) (output O, err error)
+    Transform(ctx context.Context, input *schema.StreamReader[I], opts ...Option) (output *schema.StreamReader[O], err error)
+}
+```
+
+Chapter 18 explained that any component implementing just one of these methods lets the framework auto-fill the other three paradigms. This is the dividend of Go's "implicit implementation + small interfaces" philosophy: `Graph` and `Chain` both compile into `Runnable`, so "a graph" can be dropped into another graph just like "a component" — composition recurses without limit because the seam is uniform. Likewise, the `Agent` interface (<SourceRef path="adk/interface.go:453" />) makes supervisor, DeepAgent, and your own agent mutually substitutable; and the reason Chapter 16's AgentTool can "use an agent as a tool" is essentially making the agent implement the `tool.BaseTool` seam. **Interfaces aren't for object-oriented inheritance, they're for defining "substitution points"** — this is the most Go-like part of Eino's composition philosophy.
+
+## Pillar five: persistence = standing on encoding/gob's shoulders
+
+The last pillar is the ability to save "half-run state" (Chapters 5 and 23's checkpoint/resume rely entirely on it). Eino didn't roll its own serialization protocol, but wraps a `RegisterName` layer around the standard library's `encoding/gob` (<SourceRef path="schema/serialization.go:83" />):
+
+```go
+func RegisterName[T any](name string) {
+    gob.RegisterName(name, generic.NewInstance[T]())   // <- reuse the standard library's gob
+    err := serialization.GenericRegister[T](name)      // then register into its own generic registry
+    if err != nil {
+        panic(err)
+    }
+}
+```
+
+Why gob rather than JSON? Because what a checkpoint stores is the **graph's intermediate state** — possibly containing interface types, concrete implementations, private semantics. gob natively supports "register a concrete type → restore an interface by name," which is precisely the runtime cost of "interfaces as seams": you store an interface, but reading it back requires knowing which concrete type went in. `RegisterName` feeds `gob.RegisterName` on one side and registers into Eino's own generic registry on the other, so generic types can also be restored stably by name.
+
+Be clear about one thing, though: **what this really exposes is a limitation of Go, not how good gob is.** gob is only readable inside the Go ecosystem (no cross-language story), it's opaque binary (hard to audit by hand), and it's sensitive to type evolution (adding/removing fields or renaming types can make an old checkpoint unreadable). It's chosen anyway because the requirement is "serialize a graph state that may contain interfaces and private fields" — and in today's Go there is no serialization scheme that is both native *and* handles interface polymorphism gracefully; gob is simply the one "closest to the standard library, with the least glue."
+
+And this isn't the only place Eino bumps into Go's limits: back in the parallelism pillar, native channels have a fixed capacity and can't grow unbounded, which is what forced the home-grown `UnboundedChan`; in the type-safety pillar, generics aren't expressive enough to cover "restore a type by name at runtime," which is why a generic registry has to be added on top of gob. None of these are design flaws — they're **the seam-marks an honest framework leaves at the boundary of its language.** Persistence isn't built from scratch; it wraps the ready-made gob brick into a shape that's *just barely* enough. The day Go gains a better native serialization story, this is the piece most in need of replacement.
+
+## The selection trade-off: Go's limits are often free in other languages
+
+The five sections above were all "how Eino does it in Go." But a technology choice is never "which language is better" — it's "what are you willing to pay for." Put Eino's requirements in front of Node.js and Python (the two most mainstream Agent-framework stacks today — LangChain/LangGraph's JS and Python editions happen to grow on exactly those languages) and a counter-intuitive fact surfaces: **several things Eino hand-crafts laboriously in Go are practically a one-liner freebie in a dynamic language.**
+
+First, the three places where Go pays and the others get it for free — precisely the spots where earlier chapters saw Eino forced to "top up a piece":
+
+| Capability Eino must hand-craft in Go | The Go way (has a cost) | How Python / Node give it free |
+|---|---|---|
+| **Serialize a graph state with interfaces / private fields** | `encoding/gob` + `RegisterName`, manually registering every concrete type or the interface won't read back (<SourceRef path="schema/serialization.go:83" />) | Python `pickle.dumps(obj)` stores any object in one line (private fields, nested classes); Node has `structuredClone` and a sea of serialization libs |
+| **An unbounded buffer for task results** | native `chan` has fixed capacity, so you build `UnboundedChan` from `sync.Cond` + a slice (<SourceRef path="internal/channel.go:22" />) | Python `asyncio.Queue()` and Node arrays/EventEmitter are unbounded by default — "blocks when full" simply isn't a problem |
+| **Restore a type by name at runtime** | generics are erased and you can't get a runtime type, so you build a separate generic registry as a fallback | Python has `importlib` + `getattr` and `eval`; JS has dynamic `import()` and prototype rewriting — conjuring types at runtime is routine |
+
+What these three rows share: **Go is a statically compiled language that refuses the shortcut of "conjuring types / storing arbitrary objects at runtime,"** so Eino can only claw it back with registries and condition variables — the "clumsy" way. Dynamic languages have this built in, hence the one-line freebie. If your Agent is mostly "glue third-party APIs, iterate fast, stash and reload state at will," Python/Node's convenience is real — and part of why their ecosystems are more vibrant.
+
+So why did Eino still pick Go? Because when you turn the lens to three *other* spots, the scale swings hard the other way — **and these happen to be exactly where an Agent Runtime strains hardest, while dynamic languages are either awkward or simply can't:**
+
+| Capability an Agent Runtime strains against | Go gives it free | Python / Node struggle or can't |
+|---|---|---|
+| **True parallel scheduling** | goroutines are cheap concurrency units; `go f()` is real parallelism; the runtime auto-fills cores M:N | Python's GIL keeps threads from saturating cores — real parallelism needs `multiprocessing` (heavy, must serialize across processes); Node's single-threaded loop detours through Worker Threads for CPU work |
+| **Unified cancellation** | `context.Context` is a language-wide convention: propagates everywhere, merges with timeouts, cascades cancels — near-zero cost | Node's `AbortSignal` is newer and not uniformly adopted, often wired by hand; Python threads can't be safely interrupted, so cancel semantics fracture along the execution model |
+| **Type safety that reaches runtime** | generics + compile-time checks; a wiring mistake fails at `go build`, and type info isn't erased | TS types are erased at runtime, Python hints aren't enforced — errors often defer until they blow up in production |
+
+The trade-off is now clear: **choosing Go means voluntarily giving up the convenience of "conjuring types / storing arbitrary objects at runtime" (which is *why* it must hand-craft the gob registry and UnboundedChan), in exchange for a foundation dynamic languages can't offer — true multi-core parallelism + unified cancellation + compile-time strong typing.** For a high-concurrency, cancellable, long-evolving server-side Agent Runtime, the former's cost (a few hundred extra lines of registration/buffering code) is one-time and bounded; the latter's cost (the GIL, erased types, fractured cancellation), once chosen wrong, is a recurring tax that seeps into every concurrency path and every production debugging session. That's the bet Eino makes.
+
+<Callout kind="key" title="The essence of the choice: a one-time cost vs a recurring tax">
+Go's limits (hand-crafted serialization, hand-crafted unbounded buffers, a hand-built type registry) are all **one-time costs you write once and sink to the bottom**; behind a dynamic language's convenience is **a recurring tax you pay on every concurrency, every cancellation, every production type error.** Eino picks Go not because Go is strong everywhere, but because on this particular problem — an Agent Runtime — it's willing to pay the former and refuses to pay the latter. There's no silver bullet in a technology choice, only "which kind of pain are you willing to pay for."
+</Callout>
+
+
+<Callout kind="key" title="The design key of the whole book">
+Every one of Eino's engines deliberately chooses to "grow on Go's native mechanism" rather than build a parallel system atop the language: parallelism uses goroutines (topping up an UnboundedChan only where channels fall short), cancel uses context.Context (layering only a safe-point granularity), type-safety uses generics (condensing multiple message types into a type parameter), composition uses interfaces (treating them as "substitution points," not inheritance), persistence uses gob (wrapped by a generic registry — the spot where Go's limits show most plainly). **This is what "native-Go agent runtime" truly means: the framework's complexity borrows, as much as possible, from what the language has already solved, topping up only the smallest piece in the language's seams.** Grasp this and you grasp why Eino looks the way it does — it isn't "ported to Go," it "grew out of Go."
+</Callout>
+
+<Callout kind="tip" title="Try it · the closing exercise">
+Revisit the first agent you wrote in Part I, and mentally annotate, for each of its runs, where these five pillars come into play: which goroutines spin up behind `runner.Run`? If a cancel happens, from which `ctx.Done()` does the signal enter, and through how many layers does it travel? Which generic instances are your `Agent`/`ChatModel`? If you wanted to add a checkpoint to this run, which custom types would you need to `RegisterName`? Answer all five and you're no longer just "able to use Eino" — you truly understand this agent runtime's bedrock.
+</Callout>
+
+## Chapter summary
+
+- Eino isn't "a framework implemented in Go," it's "an agent runtime grown on Go's native mechanisms" — five pillars each mapping to a language capability.
+- **Parallel scheduling**: `taskManager.submit` (<SourceRef path="compose/graph_manager.go:300" />) spawns one goroutine per parallel node, collecting results through the home-grown unbounded channel `UnboundedChan` (<SourceRef path="internal/channel.go:22" />) — topping up only where native channels fall short.
+- **Cancel propagation**: `TurnLoop.run` (<SourceRef path="adk/turn_loop.go:1570" />) builds cancel directly on `context.Context`, getting downward propagation, timeout unification, and cleanup-on-cancel for free.
+- **Type-safety**: generic `TypedAgent[M]` (<SourceRef path="adk/interface.go:453" />) and `BaseModel[M]` (<SourceRef path="components/model/interface.go:36" />) condense "multiple message types" into one type parameter, keeping zero migration via aliases.
+- **Composition seam**: interfaces like `Runnable` (<SourceRef path="compose/runnable.go:32" />) standardize "substitution points," letting a graph recurse as a component.
+- **Native persistence**: `RegisterName` (<SourceRef path="schema/serialization.go:83" />) wraps a generic registry around `encoding/gob` to power checkpoint/resume — the clearest place Go's limits show (Go-only readability, opaque binary, sensitive to type evolution); like `UnboundedChan` and the generic registry, it's a seam at the language's boundary.
+- The design key: **borrow what the language has already solved, top up only the smallest piece in the seams** — that's the "native-Go agent runtime."
+
+That closes the book. You set out from "able to use the ADK," passed through "understanding the design intent" and "seeing how it works," and finally arrived at "understanding why it's Go's." May you take away not just how to use Eino, but this design taste of "composition over branching, carrying complexity on the language's native mechanisms" — it will serve you in any system you build.

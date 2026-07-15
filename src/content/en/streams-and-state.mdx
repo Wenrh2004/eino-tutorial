@@ -1,0 +1,137 @@
+## The two closing cornerstones: streams and state
+
+We've reached the end of Part IV. The execution kernel (loop + channels) and the three builders (Graph/Chain/Workflow) are all dismantled. But two cornerstones remain untouched — and they happen to be exactly what underpins ADK's "streaming replies" and "cross-turn memory": **stream** and **state**. This chapter covers them together, because they embody the same design orientation: **cash out the strongest semantics with the leanest mechanism.**
+
+<Mermaid title="StreamReader: five sources, one outward type" chart={`
+flowchart TB
+  subgraph SRC["five sources"]
+    ST["stream · Pipe"]
+    AR["arrayReader · array disguise"]
+    MSR["multiStreamReader · merge"]
+    SRW["…WithConvert · type conversion"]
+    CSR["childStreamReader · Copy child"]
+  end
+  SRC --> SR["StreamReader[T]<br/>tagged union · dispatch by typ"]
+  SR --> RECV["Recv() runs dry after one read<br/>close exactly once"]
+`} />
+
+
+## A stream isn't data — it's a one-shot water pipe
+
+First, correct one intuition. Eino's `StreamReader[T]` (<SourceRef path="schema/stream.go:168" />) isn't a slice holding data; it's a pipe that **runs dry after one read**. The docs say it plainly: read-once, only one goroutine may call `Recv`, and it must be closed exactly once.
+
+Its entry point is `Pipe` (<SourceRef path="schema/stream.go:99" />), handing you a reader/writer pair; the writer end `Send`s, the reader end `Recv`s until `io.EOF`. But the truly elegant part is `StreamReader`'s internal structure — it's a **tagged union**:
+
+```go
+type StreamReader[T any] struct {
+    typ readerType          // which kind of reader am I?
+
+    st  *stream[T]              // a real pipe (from Pipe)
+    ar  *arrayReader[T]         // an array masquerading as a stream
+    msr *multiStreamReader[T]   // a multi-way stream from Merge
+    srw *streamReaderWithConvert[T] // a stream with type conversion
+    csr *childStreamReader[T]   // a child stream from Copy
+}
+```
+
+`Recv` is just a switch dispatching on `typ`. Why this design? Because a "stream" in Eino has five origins (pipe, array, merge, convert, copy), yet to the user it must be **one single type**. A union plus a tag avoids interface-boxing overhead while keeping all five origins outwardly identical. That's the chapter's first design signal: **one unified outward type, internal dispatch on demand.**
+
+## Copy: a copy-on-read singly-linked list
+
+A stream is gone after one read — so what about "one LLM's output that must both be shown to the user and fed to the next node"? The answer is `Copy(n)` (<SourceRef path="schema/stream.go:261" />).
+
+The difficulty: you don't know the upstream length in advance, and the n consumers each read independently at different paces. Eino's solution is beautiful — a **copy-on-read singly-linked list**. The core type is `cpStreamElement` (<SourceRef path="schema/stream.go:784" />):
+
+```go
+type cpStreamElement[T any] struct {
+    once sync.Once            // guarantees this slot reads from the source only once
+    next *cpStreamElement[T]  // points to the next slot (created only when reached)
+    item streamItem[T]        // the cached chunk of data
+}
+```
+
+`Copy` builds one `parentStreamReader` (<SourceRef path="schema/stream.go:823" />) and n `childStreamReader`s (<SourceRef path="schema/stream.go:883" />). Each child remembers which slot of the list it's at. When a child `Recv`s, it lands in `peek` (<SourceRef path="schema/stream.go:837" />), whose core is one passage:
+
+```go
+elem.once.Do(func() {
+    t, err = p.sr.Recv()          // only the first child to reach this slot actually reads the source
+    elem.item = streamItem[T]{chunk: t, err: err}
+    if err != io.EOF {
+        elem.next = &cpStreamElement[T]{}  // lay down the next slot while we're here
+        p.subStreamList[idx] = elem.next
+    }
+})
+// later children just read the cached elem.item, never touching the source
+```
+
+`sync.Once` is the soul here: **for any one slot, no matter how many children pass through, only the first actually `Recv`s the source once; the rest read the cache.** Fast children lay track forward along the list; slow ones follow the same chain — nobody double-consumes the source and nobody has to wait for the others. Only when all children close does the source get closed (`close` counts with `closedNum`, <SourceRef path="schema/stream.go:868" />).
+
+<Callout kind="key" title="The design key for this chapter">
+Streams and state share one design philosophy: **carry the strongest semantics with the smallest mechanism, and defer cost to the exact moment it's needed.** `Copy` doesn't pre-read or buffer the whole stream — it does **lazy copy-on-read** with a `sync.Once`-guarded linked list: fast consumers lay track, slow ones catch up, each source slot read exactly once. Merge interleaves **in arrival order** via select rather than round-robin, going with the flow. State keeps no global dictionary; instead it strings each graph level's state into a `parent` chain, and `ProcessState[S]` **walks up level by level via type assertion** to find the level matching `S`. Both refuse "compute ahead, store centrally" and choose "evaluate on use, dispatch on demand" — precisely what lets ADK's streaming and memory work without dragging down performance.
+</Callout>
+
+## Merge: interleave in arrival order
+
+`Copy` is one-to-many; `Merge` is many-to-one. `MergeStreamReaders` (<SourceRef path="schema/stream.go:912" />) fuses N streams into one. Note its semantics: **interleaved in arrival order — not round-robin, no ordering guarantee** — whichever source produces data first is emitted first. The merged stream reaches EOF only after every source is exhausted.
+
+Its implementation is `multiStreamReader`, whose `recv` (<SourceRef path="schema/stream.go:538" />) takes two paths: with few sources (≤5) it uses a set of hand-coded `select`s (<SourceRef path="schema/select.go:21" />), and only with many sources (>5) does it reach for `reflect.Select`. That threshold of 5 is `maxSelectNum` (<SourceRef path="schema/select.go:19" />):
+
+```go
+const maxSelectNum = 5
+```
+
+Why two paths? `reflect.Select` is flexible but slow; and the vast majority of merges have few sources, so Eino hand-writes unrolled `select`s for 2–5 ways and eliminates the reflection overhead. It's another "hand-optimize the common path, degrade to reflection only for the rare one" trade-off — exactly like the last chapter's "block at compile time whatever can be" in type checking.
+
+There's a variant, `MergeNamedStreamReaders` (<SourceRef path="schema/stream.go:990" />): when one source hits EOF, it emits a `SourceEOF` telling you **which source finished**, rather than silently swallowing it. In multi-agent flows, "drain A before handling B" relies on this. Both funnel into `InternalMergeNamedStreamReaders` (<SourceRef path="schema/stream.go:1010" />).
+
+## Boxing and unboxing: the boundary between stream and non-stream
+
+Some nodes emit streams, some emit single values. How does the orchestration engine smooth over the difference? With a pair of inverse operations.
+
+**Boxing**: disguise an already-computed value as a stream with `StreamReaderFromArray` (<SourceRef path="schema/stream.go:461" />) — it simply stuffs an `arrayReader` that `Recv`s items one by one, then `io.EOF`. A non-stream node's output is thus "boxed" into the stream the downstream expects.
+
+**Unboxing**: conversely, collapse a stream into a single value with `concatStreamReader` (<SourceRef path="compose/stream_concat.go:50" />) — it gathers every chunk of the stream and hands them to `internal.ConcatItems` (<SourceRef path="internal/concat.go:91" />) to concatenate by type (map merge, slice append, or your registered concat function). The pile of `Message` fragments an LLM streams out is stitched back into one complete message exactly this way.
+
+**Boxing/unboxing is Eino's unified technique for "mixing streams and non-streams"**: the engine can always shape any node's output into the form the downstream wants, so the user barely feels "whether this node is actually streaming."
+
+## State: a chain walked up by type
+
+Finally, state. ADK's memory and cross-node shared data all bottom out in compose's state.
+
+How is state stored? At run time, if the graph registered `WithGenLocalState` (<SourceRef path="compose/generic_graph.go:37" />), `runCtx` builds an `internalState` and puts it into the context (<SourceRef path="compose/graph.go:842" />). The key is that this struct (<SourceRef path="compose/state.go:34" />) carries a `parent` pointer:
+
+```go
+type internalState struct {
+    state  any
+    mu     sync.Mutex
+    parent *internalState   // points to the outer graph's state
+}
+```
+
+So when graphs nest (e.g., an ADK agent that is itself a graph inside), state strings into a chain from inner to outer. When you read state with `ProcessState[S]` (<SourceRef path="compose/state.go:165" />), it calls `getState[S]` (<SourceRef path="compose/state.go:175" />) to **do a type assertion at each level** along this chain:
+
+```go
+for interState != nil {
+    if cState, ok := interState.state.(S); ok {
+        return cState, &interState.mu, nil   // found the level whose type matches
+    }
+    interState = interState.parent            // no match, walk up to the outer level
+}
+```
+
+This design is delightful: **state is found by type, not by name.** When you call `ProcessState[*MyState]` inside an inner graph, it starts from the innermost and walks outward, finding the first graph level whose state type is exactly `*MyState`, returning it and its own dedicated lock (one `mu` per level, <SourceRef path="compose/state.go:36" />). This makes "inner can read state shared from the outer" natural, with no global registry — the type itself is the addressing key.
+
+<Callout kind="tip" title="Try it">
+Run an experiment to feel `Copy`'s laziness: `Pipe` a stream, `Copy(2)`, let one child read it all in one go, then have the other read a while later. You'll find the slow one still reads all the data — because the fast one laid the list's track (<SourceRef path="schema/stream.go:837" />). Now reason through `sync.Once`'s role again: remove it, and the same slot would be read from the source once per child, corrupting the data.
+</Callout>
+
+## Chapter summary
+
+- **A stream is a read-once pipe**; `StreamReader` (<SourceRef path="schema/stream.go:168" />) is a tagged union — five origins unified outward, `Recv` dispatching by tag.
+- **Copy** (<SourceRef path="schema/stream.go:261" />) fans out via a `sync.Once`-guarded copy-on-read linked list (<SourceRef path="schema/stream.go:784" />): each slot read from the source once, fast lays track, slow catches up, source closes only when all close.
+- **Merge** (<SourceRef path="schema/stream.go:912" />) interleaves in arrival order; ≤5 sources use hand-written `select`, >5 use `reflect.Select` (threshold `maxSelectNum=5`, <SourceRef path="schema/select.go:19" />).
+- **Boxing** (<SourceRef path="schema/stream.go:461" />) disguises a value as a stream, **unboxing** (<SourceRef path="compose/stream_concat.go:50" />→<SourceRef path="internal/concat.go:91" />) stitches a stream back into a value, smoothing the stream/non-stream boundary.
+- **State** (<SourceRef path="compose/state.go:34" />) is a `parent`-linked chain; `ProcessState[S]` (<SourceRef path="compose/state.go:165" />) walks up **by type**, each level with its own lock — type is the address.
+- The design key: streams and state both practice "smallest mechanism, strongest semantics, cost deferred" — precisely the bedrock of ADK's streaming and memory.
+
+That closes Part IV: you've now seen the whole of compose, from execution kernel through the three builders to streams and state. The next part pulls the lens back to the global view — a tour and extension of how the three layers, ADK, compose, and components, mesh into one complete framework.

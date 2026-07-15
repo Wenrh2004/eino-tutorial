@@ -1,0 +1,134 @@
+## 三种写法,一个底座
+
+上一章你看清了 compose 的执行内核:一个循环 + 两种 channel。但你在真实代码里几乎不会直接摆弄 channel——你用的是三个面向用户的构建器:`Graph`、`Chain`、`Workflow`。这一章我们要弄清两件事:这三者是什么关系(剧透:后两者都是 `Graph` 的糖),以及一个更关键的问题——**当你把两个类型对不上的节点连起来时,框架凭什么能在编译期就报错,而不是等到线上炸掉?**
+
+<Mermaid title="Graph 是底座,Chain/Workflow 是语法糖" chart={`
+flowchart TB
+  CHAIN["Chain[I,O]<br/>线性写法糖<br/>nodeIdx / preNodeKeys"]
+  WF["Workflow[I,O]<br/>字段级映射糖<br/>DAG 编排"]
+  GRAPH["Graph[I,O]<br/>对外泛型 · 类型安全"]
+  INNER["*graph（内部·类型擦除）<br/>节点 / 边 / toValidateMap / 校验"]
+  CHAIN --> GRAPH
+  WF --> GRAPH
+  GRAPH --> INNER
+`} />
+
+
+## 底座:泛型的 Graph
+
+一切的地基是泛型 `Graph[I, O]`(<SourceRef path="compose/generic_graph.go:93" />):
+
+```go
+// I: 编译产物的输入类型;O: 输出类型
+type Graph[I, O any] struct {
+    *graph        // 内嵌一个非泛型的内部 graph
+}
+```
+
+注意这个设计:对外是带类型参数的 `Graph[I, O]`,给你端到端的类型安全;对内嵌一个"擦掉类型"的 `*graph`,承载真正的节点、边、校验逻辑。构造入口 `NewGraph[I, O]`(<SourceRef path="compose/generic_graph.go:72" />)就是给内部 graph 记上 `I`/`O` 两个 `reflect.Type`。而 `Chain` 和 `Workflow`,本质上都是"往这个内部 graph 上叠 API 糖"。
+
+## 编译期类型检查:reflect.Type 的传播与硬闸门
+
+先讲最有分量的机制,因为它是 Eino"类型安全"承诺的兑现处。
+
+当你调 `AddEdge(a, b)`(<SourceRef path="compose/generic_graph.go:106" />),它转调内部的 `addEdgeWithMappings`(<SourceRef path="compose/graph.go:232" />)。这里不只是"记一条边",它当场做两件事(<SourceRef path="compose/graph.go:285" />):把这条边登记进一个待校验表 `toValidateMap`,然后立刻跑一次 `updateToValidateMap()` 去校验。
+
+`toValidateMap`(字段定义 <SourceRef path="compose/graph.go:65" />)是一张"还没确认类型兼容的边"的清单。真正的校验发生在 `updateToValidateMap`(<SourceRef path="compose/graph.go:561" />)里,它反复扫描这张表,对每条边取出上游的输出类型和下游的输入类型,做一次 `checkAssignable`(<SourceRef path="compose/graph.go:592" />):
+
+```go
+result := checkAssignable(startNodeOutputType, endNodeInputType)
+if result == assignableTypeMustNot {
+    return fmt.Errorf("graph edge[%s]-[%s]: start node's output type[%s] and end node's input type[%s] mismatch", ...)
+}
+```
+
+**类型对不上,`AddEdge` 这一行当场返回 error**——不是等到运行、不是等到 Compile,就在你连线的那一刻。这就是为什么 Eino 敢说"编排是类型安全的"。
+
+<Callout kind="key" title="本章的设计钥匙">
+Eino 的类型安全,靠的是**编译期的类型传播 + 分层的校验闸门**。`reflect.Type` 沿着边在图里传播:一旦一端类型已知,`updateToValidateMap` 就能推断另一端,甚至把类型"灌"进中间的无类型 passthrough 节点(<SourceRef path="compose/graph.go:561" />)。校验分两道闸:**硬性不兼容**(`assignableTypeMustNot`)在 `AddEdge` 当场报错;而涉及**接口**的"可能兼容"(`assignableTypeMay`)则不硬拦,改为挂一个运行时转换器延后处理。这种"能编译期确定的就编译期拦、拦不了的才降到运行时"的分层,正是把错误尽量左移(shift-left)的工程哲学。
+</Callout>
+
+还有第二道闸,在 `Compile` 时兜底(<SourceRef path="compose/graph.go:708" />):
+
+```go
+// toValidateMap isn't empty means there are nodes that cannot infer type
+for _, v := range g.toValidateMap {
+    if len(v) > 0 {
+        return nil, fmt.Errorf("some node's input or output types cannot be inferred: %v", g.toValidateMap)
+    }
+}
+```
+
+如果编译时还有边留在 `toValidateMap` 里没被消化——通常是几个无类型 passthrough 节点首尾相连、始终没有一个"有类型的锚"能推断出来——Compile 就拒绝出图。两道闸各司其职:第一道抓"连错类型",第二道抓"类型推不出来"。
+
+## Chain:线性的语法糖
+
+理解了底座,`Chain` 就一目了然了。`NewChain[I, O]`(<SourceRef path="compose/chain.go:37" />)内部就是 `NewGraph[I, O]`,只是把组件标记成 `ComponentOfChain`。`Chain` 结构(<SourceRef path="compose/chain.go:72" />)持有那个 `*Graph[I, O]`,外加一点点线性记账:`nodeIdx`(自动生成节点名用)、`preNodeKeys`(上一个节点是谁)。
+
+所有的 `AppendXxx` 最终都汇进 `addNode`(<SourceRef path="compose/chain.go:560" />),它做的事朴素得可爱:
+
+```go
+// 自动生成 key,加节点
+err := c.gg.addNode(nodeKey, node, options)
+// ...第一个节点自动从 START 连过来
+if len(c.preNodeKeys) == 0 {
+    c.preNodeKeys = append(c.preNodeKeys, START)
+}
+// 把上一个节点连到当前节点
+for _, preNodeKey := range c.preNodeKeys {
+    c.gg.AddEdge(preNodeKey, nodeKey)
+}
+c.preNodeKeys = []string{nodeKey}   // 当前节点成为下一个的"上游"
+```
+
+**Chain 就是"自动帮你 `AddEdge` 成一条直线"的 Graph**,没有任何新执行语义。它甚至不选执行模式——上一章说过,模式在 `graph.compile` 里定,Chain 依旧默认跑 Pregel。它的价值纯粹是省掉手写线性连线的样板。
+
+## Workflow:字段级映射 + 强制 DAG
+
+`Workflow` 则走向另一个方向:它不是"简化连线",而是"升级连线的表达力"。看它的结构(<SourceRef path="compose/workflow.go:43" />)和那句点睛的注释:
+
+```go
+// Workflow is wrapper of graph, replacing AddEdge with declaring dependencies
+// and field mappings between nodes.
+// Under the hood it uses NodeTriggerMode(AllPredecessor), so does not support cycles.
+type Workflow[I, O any] struct {
+    g                *graph
+    workflowNodes    map[string]*WorkflowNode
+    // ...
+}
+```
+
+两个关键词:**字段映射**和 **AllPredecessor**(强制 DAG)。
+
+**字段映射**是 Workflow 最大的表达力升级。普通 `AddEdge` 是"把上游的整个输出喂给下游";而 Workflow 用 `AddInput`(<SourceRef path="compose/workflow.go:197" />)可以精确到**字段级**:
+
+```go
+// 把上游 A 的 Score 字段,映射到当前节点输入的 Rating 字段
+node.AddInput("A", compose.MapFields("Score", "Rating"))
+```
+
+这里的 `MapFields`(<SourceRef path="compose/field_mapping.go:85" />)、`FromField`(<SourceRef path="compose/field_mapping.go:65" />)、`ToField`(<SourceRef path="compose/field_mapping.go:73" />)构造出 `FieldMapping`(<SourceRef path="compose/field_mapping.go:31" />)。底层 `addDependencyRelation`(<SourceRef path="compose/workflow.go:316" />)把每条映射翻译成一次带 mappings 的图内边——所以字段映射并不是新引擎,它仍然落在同一个内部 graph 上,只是这条边额外携带了"取哪个字段、放哪个字段"的信息。
+
+**强制 DAG** 则是刻意的取舍。上一章讲过,`graph.compile` 里只要 `isWorkflow(g.cmp)` 为真就切 DAG 模式。为什么 Workflow 甘愿放弃环?因为字段级数据流水线的心智模型天然是"数据从上游字段流向下游字段"的**有向无环**图;放弃环,换来的是"所有前驱齐活才触发"的确定性,以及 skip 传播带来的分支能力。这是一个非常清醒的产品决策:**Chain 用无环换线性简洁,Workflow 用无环换字段级数据编排,而需要环的场景(如 ReAct)才回到 Pregel 的 Graph**。
+
+<Callout kind="note" title="三者如何选">
+- **Chain**:纯线性流水线(A→B→C),要的就是少写样板。
+- **Graph**:需要环、需要复杂分支/返回边(ReAct、多智能体循环)——跑 Pregel。
+- **Workflow**:多输入汇聚、要精确到字段的数据映射、且天然无环(表单审批、并行研究后汇总)——跑 DAG。
+
+三者共享同一个类型检查底座和同一个执行内核,只在"如何声明拓扑"和"跑哪种 channel"上分道。
+</Callout>
+
+<Callout kind="tip" title="动手">
+写两段等价的流水线:一段用 `Chain.AppendXxx`,一段用 `Graph.AddNode`+`AddEdge` 手连。对照 <SourceRef path="compose/chain.go:560" />,确认 Chain 帮你省掉的正是那几行 `AddEdge`。然后故意把两个类型不兼容的节点用 `AddEdge` 连起来,观察它在**哪一行**报错——是 `AddEdge` 还是 `Compile`?回到 <SourceRef path="compose/graph.go:592" /> 验证你的判断。
+</Callout>
+
+## 本章小结
+
+- 底座是泛型 `Graph[I, O]`(<SourceRef path="compose/generic_graph.go:93" />):对外类型安全,对内嵌一个擦除类型的 `*graph` 承载节点/边/校验。
+- **类型检查**靠 `reflect.Type` 沿边传播 + 两道闸:`AddEdge` 当场跑 `updateToValidateMap`(<SourceRef path="compose/graph.go:561" />),硬性不兼容立即报错(<SourceRef path="compose/graph.go:592" />);`Compile` 再兜底"类型推不出来"(<SourceRef path="compose/graph.go:708" />)。涉及接口的"可能兼容"降级为运行时转换。
+- **Chain**(<SourceRef path="compose/chain.go:72" />)是线性语法糖:`addNode`(<SourceRef path="compose/chain.go:560" />)自动 `AddEdge` 成直线,无新语义,默认仍 Pregel。
+- **Workflow**(<SourceRef path="compose/workflow.go:43" />)升级连线表达力:`AddInput`+`FieldMapping`(<SourceRef path="compose/field_mapping.go:31" />)做**字段级**数据映射,并**强制 DAG**(放弃环换确定性)。
+- 设计钥匙:三者共享类型底座与执行内核,只在拓扑声明方式与 channel 选择上分化——**用同一个底座长出三种表达力**。
+
+下一章我们钻进最后两块基石:流(stream)如何被复制、合并、装箱,以及状态(state)如何按类型在嵌套图里被逐级找到——这两者支撑起了 ADK 的流式与记忆。

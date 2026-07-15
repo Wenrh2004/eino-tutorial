@@ -1,0 +1,114 @@
+## One message type is no longer enough
+
+Chapter 8 planted a seed: every ADK type carries `[M MessageType]`, and `MessageType` allows only two messages — `*schema.Message` and `*schema.AgenticMessage`. This chapter completes Part II's last puzzle piece: **why did v0.9 generify the whole ADK?**
+
+The answer starts with the limits of the classic `schema.Message`. It was born in the "plain-text conversation" era: one `Content string` holds text, one `ToolCalls` holds tool calls. But once models enter the **multimodal + rich-content-block** era — a single assistant message might carry reasoning, a generated image, and several tool calls at once — cramming all that into one flat struct falls apart.
+
+## AgenticMessage: a container of content blocks
+
+The new `AgenticMessage` (<SourceRef path="schema/agentic_message.go:71" />) switches to a different modeling idea:
+
+```go
+type AgenticMessage struct {
+    Role          AgenticRoleType      // system / user / assistant
+    ContentBlocks []*ContentBlock      // the core: one message = a series of blocks
+    ResponseMeta  *AgenticResponseMeta // token usage, per-vendor extensions
+    Extra         map[string]any
+}
+```
+
+Compared with the classic `Message`, note two deliberate removals: **no `Content string`, and no top-level `ToolCalls`.** Everything — text, image, reasoning, tool calls, tool results — is expressed uniformly as blocks inside `ContentBlocks`. Roles also collapse to three: `system` / `user` / `assistant` (<SourceRef path="schema/agentic_message.go:66" />), with not even a "tool" role — tool results ride as content blocks inside a user message.
+
+<Mermaid title="AgenticMessage: one message = a series of content blocks" chart={`
+flowchart TB
+  MSG["AgenticMessage<br/>Role: assistant"]
+  MSG --> CBS["ContentBlocks []*ContentBlock"]
+  CBS --> B1["ContentBlock<br/>Type = reasoning"]
+  CBS --> B2["ContentBlock<br/>Type = assistant_gen_text"]
+  CBS --> B3["ContentBlock<br/>Type = assistant_gen_image"]
+  CBS --> B4["ContentBlock<br/>Type = function_tool_call"]
+  B1 -.set.-> P1["Reasoning *Reasoning"]
+  B2 -.set.-> P2["AssistantGenText *…"]
+  B3 -.set.-> P3["AssistantGenImage *…"]
+  B4 -.set.-> P4["FunctionToolCall *…"]
+`} />
+
+
+## ContentBlock: a "tagged union"
+
+`ContentBlock` (<SourceRef path="schema/agentic_message.go:102" />) is the heart of this design. It's **not an interface, but a struct with a discriminator field** (a tagged union):
+
+```go
+type ContentBlock struct {
+    Type ContentBlockType // discriminator: which kind of block
+
+    Reasoning          *Reasoning          // reasoning / thinking
+    UserInputText      *UserInputText      // user text
+    UserInputImage     *UserInputImage     // user image
+    AssistantGenText   *AssistantGenText   // assistant-generated text
+    AssistantGenImage  *AssistantGenImage  // assistant-generated image
+    FunctionToolCall   *FunctionToolCall   // tool call
+    FunctionToolResult *FunctionToolResult // tool result
+    // …plus audio/video/file, server tool, MCP, and a long tail
+}
+```
+
+The rule is simple: `Type` says which kind this is, the matching pointer field is set, the rest are `nil`. The kinds are enumerated by `ContentBlockType` constants (<SourceRef path="schema/agentic_message.go:40" />): `reasoning`, `user_input_text/image/audio/video/file`, `assistant_gen_text/image/audio/video`, `function_tool_call/result`, plus a full server-tool and MCP set.
+
+<Callout kind="note" title="Why a struct union rather than a Go interface">
+Go has no native sum type. An interface + type assertions could express "polymorphic blocks" too, but serialization (gob/JSON), cross-language alignment, and field discoverability all suffer. A struct union with "a discriminator field + a set of pointers" buys: fields in plain sight, direct serialization, and consumers that can exhaustively handle everything with `switch block.Type`. It's the pragmatic idiom for a sum type in Go.
+</Callout>
+
+## Generification: one skeleton, two messages
+
+With two message types, the real question arrives: must we write the Runner, Agent, middleware, and model interface **twice**? v0.9's answer is generics — unify both with a single type parameter `M`.
+
+The linchpin is `model.BaseModel[M]` (<SourceRef path="components/model/interface.go:36" />):
+
+```go
+type BaseModel[M messageType] interface {
+    Generate(ctx context.Context, input []M, opts ...Option) (M, error)
+    Stream(ctx context.Context, input []M, opts ...Option) (*schema.StreamReader[M], error)
+}
+```
+
+One generic interface; fill in `M` and you have both models. And — crucially — **no old code needs to change**, because the familiar names become aliases:
+
+```go
+type BaseChatModel = BaseModel[*schema.Message]         // classic chat model
+type AgenticModel  = BaseModel[*schema.AgenticMessage]  // new agentic model
+```
+
+<Callout kind="key" title="The design key for this chapter">
+Generification is essentially **erasing a whole set of duplication with one type parameter.** Runner, event stream, middleware, model — write one `[M]`-parameterized implementation, and `M=*schema.Message` is the classic chat world while `M=*schema.AgenticMessage` is the multimodal agentic world. The two worlds share the same runtime skeleton (Chapter 8's event stream), the same interrupt/resume, the same multi-agent composition, yet each holds the message model that fits best. Aliases like `BaseChatModel` keep this big refactor **completely transparent** to existing users — a model of "carrying evolution in the type system": capabilities double, concepts don't grow, old code doesn't break.
+</Callout>
+
+## The sealed union: balancing freedom and restraint
+
+You might ask: if it's generic, why not let users define a third message type? Look at `MessageType`'s definition (<SourceRef path="adk/interface.go:43" />):
+
+```go
+type MessageType interface {
+    *schema.Message | *schema.AgenticMessage
+}
+```
+
+This is a **sealed union** — external packages can't add types to it. The source comment says it outright: precisely because membership is fixed, the framework's internal generic functions can safely handle every case with an **exhaustive type switch**. Open it up and any `switch m.(type)` would miss an unknown type, collapsing the whole type-safety promise.
+
+This is deliberate restraint: generics give the reuse of "one codebase, two messages"; the sealed union gives the safety of "compile-time exhaustiveness." Together they make evolution both flexible and under control.
+
+## How the two messages interoperate
+
+Since tool nodes produce classic `*schema.Message`, how does the agentic world consume them? Eino doesn't stuff a bidirectional converter into the `schema` package; it converts on demand at the seams — the `Message → AgenticMessage` bridge for tool results lives in `compose/agentic_tools_node.go` (e.g. `toolMessageToAgenticMessage`). Add the streaming merge primitive `ConcatAgenticMessages` (<SourceRef path="schema/agentic_message.go:901" />), which regroups chunk blocks by `Index` — and the two messages stay self-consistent in their own territory, adapting only minimally and one-directionally at the boundary.
+
+## Chapter summary (and a Part II retrospective)
+
+- The classic `Message` (flat text + ToolCalls) can't support multimodal rich content; `AgenticMessage` (<SourceRef path="schema/agentic_message.go:71" />) carries everything uniformly via **ContentBlocks**.
+- `ContentBlock` (<SourceRef path="schema/agentic_message.go:102" />) is a struct union of **a discriminator field + a set of pointers** — the pragmatic idiom for a sum type in Go.
+- Generic `BaseModel[M]` (<SourceRef path="components/model/interface.go:36" />) + aliases (`BaseChatModel` / `AgenticModel`) = one skeleton, two messages, transparent to old code.
+- `MessageType` (<SourceRef path="adk/interface.go:43" />) is a **sealed union**, buying compile-time exhaustive type safety.
+- The two messages convert on demand, one-directionally at the boundary — no global bidirectional converter.
+
+That closes Part II. Looking back, Eino's design philosophy has really one throughline: **model "control flow," "messages," and "capabilities" all as composable, serializable data, then let the type system backstop it** — so streaming, interrupts, multi-agent, and multimodality all become natural results growing from one foundation.
+
+In the next part, we open the hood to see how this elegant design is actually **implemented** inside the `Runner`, `flowAgent`, and the graph engine.

@@ -1,0 +1,217 @@
+## Parallelism has two ends, and we always stare at only one
+
+When people hear "parallelism," most picture "several nodes running at once." But that's only **one** end. A parallel path, from "fork" to "join," actually spans two starkly different mechanisms:
+
+- **Fan-out**: one node's output must feed several downstreams at once. The question is — how does that output get "cloned"? Do values and streams clone the same way?
+- **Fan-in**: several upstream outputs must converge on one downstream. The question is — how are those outputs "merged"? How do you merge maps, how do you merge streams? And how many upstreams must arrive before the downstream fires?
+
+The last two chapters covered the Pregel/DAG engines and copy-on-read for streams separately. This chapter gathers them under the unified lens of "parallelism": both ends reduce to a core function in compose — fan-out is `copyItem`, fan-in is `mergeValues` — while "how many upstreams the downstream waits for" is decided by the trigger mode (Pregel vs DAG). After this chapter, when you draw a dataflow diagram, you'll no longer treat "fork" and "join" as arrows to be taken for granted.
+
+Feel it hands-on first, then take it apart piece by piece:
+
+<Viz name="fan-in-fan-out" />
+
+## Minimal example: one parallel research run
+
+The graph below throws a question at two retrievers at once, then aggregates the two results. It triggers both fan-out and fan-in:
+
+```go
+g := compose.NewGraph[string, *Report]()
+_ = g.AddLambdaNode("split", compose.InvokableLambda(splitQuery))
+_ = g.AddLambdaNode("web",   compose.InvokableLambda(searchWeb))    // branch A
+_ = g.AddLambdaNode("kb",    compose.InvokableLambda(searchKB))     // branch B
+_ = g.AddLambdaNode("merge", compose.InvokableLambda(mergeReports))
+
+_ = g.AddEdge("split", "web")   // ┐ fan-out: split's output feeds both web and kb
+_ = g.AddEdge("split", "kb")    // ┘
+_ = g.AddEdge("web", "merge")   // ┐ fan-in: web and kb converge on merge
+_ = g.AddEdge("kb",  "merge")   // ┘
+```
+
+- `split` has two out-edges → the engine must **fan out** `split`'s output to `web` and `kb`.
+- `merge` has two in-edges → the engine must **fan in** the outputs of `web` and `kb` into one, then feed `merge`.
+
+The user wrote not a single line for either — both are hidden in the engine. Let's dig out the core function of each end.
+
+## Fan-out: copyItem — values share a reference, streams get copied
+
+The whole secret of fan-out is condensed into an astonishingly short function, `copyItem` (<SourceRef path="compose/graph_run.go:1020" />):
+
+```go
+func copyItem(item any, n int) []any {
+    if n < 2 {
+        return []any{item}          // only one downstream, return as-is
+    }
+    ret := make([]any, n)
+    if s, ok := item.(streamReader); ok {
+        ss := s.copy(n)             // <- stream: split into n independently readable readers
+        for i := range ret {
+            ret[i] = ss[i]
+        }
+        return ret
+    }
+    for i := range ret {
+        ret[i] = item               // <- plain value: n slots hold the SAME item (shared reference!)
+    }
+    return ret
+}
+```
+
+Stare at that last `for`: for a plain value, `copyItem` **does no deep copy at all** — it stuffs the same `item` into n slots. That means `web` and `kb` receive **the same object reference**. This is a deliberate performance trade-off (avoiding pointless deep copies), but it leaves you a landmine:
+
+<Callout kind="warning" title="Fan-out's shared-reference trap">
+Parallel downstreams receive the same value reference. If the `web` branch internally **mutates** that shared object in place (e.g. stuffing a key into a passed-in map, appending to a slice), the `kb` branch will see polluted data, producing hard-to-reproduce race bugs. The rule is simple: **a fan-out downstream reads only; do not mutate the shared input in place; if you must change it, copy your own first**. This is also why many Eino node functions favor a pure-function style of "read the input, produce a new value."
+</Callout>
+
+And when the output is a **stream**, sharing a reference simply doesn't hold — a stream can be consumed only once, and two downstreams reading from it will inevitably collide. So once `copyItem` detects a `streamReader`, it switches to `s.copy(n)`. The copy here isn't transcribing the data n times, but the **copy-on-read** from the last chapter: n copies share one hidden singly-linked list of `cpStreamElement`, each holding its own cursor, lazily fetching via `peek` (<SourceRef path="schema/stream.go:837" />):
+
+```go
+func (p *parentStreamReader[T]) peek(idx int) (t T, err error) {
+    elem := p.subStreamList[idx]
+    // sync.Once: whichever copy reads this chunk first does the real Recv and caches it,
+    // the rest read the same cache along the list, never re-pulling upstream.
+    elem.once.Do(func() {
+        t, err = p.sr.Recv()
+        elem.item = streamItem[T]{chunk: t, err: err}
+        if err != io.EOF {
+            elem.next = &cpStreamElement[T]{}
+            p.subStreamList[idx] = elem.next
+        }
+    })
+    // ...advance the cursor along subStreamList[idx]
+}
+```
+
+**So the two cases of fan-out get a unified-yet-different answer: values via a shared reference (zero-copy, read-only), streams via copy-on-read (zero re-pull, each reads its own).** One `copyItem` gathers both semantics in one place.
+
+## Fan-in: mergeValues — maps by key-union, streams by arrival order
+
+At the fan-in end, the core is `mergeValues` (<SourceRef path="compose/values_merge.go:39" />). It looks at the first value's type, then decides how to merge:
+
+```go
+// caller guarantees len(vs) > 1
+func mergeValues(vs []any, opts *mergeOptions) (any, error) {
+    v0 := reflect.ValueOf(vs[0])
+    t0 := v0.Type()
+    if fn := internal.GetMergeFunc(t0); fn != nil {  // map / types with a registered merge func
+        return fn(vs)
+    }
+    if s, ok := vs[0].(streamReader); ok {           // multiple streams
+        // ...after type checks
+        ms := s.merge(ss)                            // combine into one multiStreamReader
+        return ms, nil
+    }
+    return nil, fmt.Errorf("(mergeValues) unsupported type: %v", t0)
+}
+```
+
+Two main cases. First, **map**, via `mergeMap` (<SourceRef path="internal/merge.go:62" />):
+
+```go
+func mergeMap(typ reflect.Type, vs []any) (any, error) {
+    merged := reflect.MakeMap(typ)
+    for _, v := range vs {
+        iter := reflect.ValueOf(v).MapRange()
+        for iter.Next() {
+            key, val := iter.Key(), iter.Value()
+            if merged.MapIndex(key).IsValid() {
+                return nil, fmt.Errorf("(values merge map) duplicated key ('%v') found", key)
+            }
+            merged.SetMapIndex(key, val)             // <- union of keys
+        }
+    }
+    return merged.Interface(), nil
+}
+```
+
+This is a **key-union**: combine multiple upstreams' maps into one big map. Note the `duplicated key` check — **if two upstreams produce the same key, the merge returns an error** (rather than the latter overwriting the former). This is deliberate strictness: fan-in semantics are "each upstream contributes different fields," and a key clash usually means the graph is mis-wired; better to error on the spot than silently overwrite and bury a landmine.
+
+<Callout kind="note" title="Why a key clash errors instead of overwriting">
+"Last write wins" is common sense in a single-machine map, but in **parallel fan-in** it's a disaster: which of two upstreams arrives first is nondeterministic (see the arrival order below), and if overwriting were allowed, the merged result would depend on scheduling timing, becoming irreproducible random behavior. Erroring forces you to divide fields cleanly at design time — of a piece with Chapter 19's DAG "fire only when all are settled" strictness.
+</Callout>
+
+Second, **multiple streams**, combined into one `multiStreamReader`, whose `recv` determines the arrival order (<SourceRef path="schema/stream.go:538" />):
+
+```go
+func (msr *multiStreamReader[T]) recv() (T, error) {
+    for len(msr.nonClosed) > 0 {
+        // use reflect.Select / receiveN to pull from whichever stream "has data now"
+        chosen, item, ok := receiveN(msr.nonClosed, msr.sts)
+        if ok {
+            return item.chunk, item.err            // <- whoever has data first returns first
+        }
+        // ...drop closed streams
+    }
+    return t, io.EOF
+}
+```
+
+**Fan-in of multiple streams isn't an "A-then-B" concatenation, but an interleave by chunk arrival order**: whichever stream has data at the moment gets its chunk emitted first. This matters for streaming agents — you don't want to wait for the slowest stream to finish before you begin emitting.
+
+## Who decides "how many upstreams a fan-in node waits for"
+
+`mergeValues` answers "how to merge once everyone arrives," but there's a prior question: **how many upstreams must arrive before the fan-in node fires?** This is precisely Chapter 19's Pregel/DAG difference, expressed in the fan-in scenario.
+
+Pregel's `pregelChannel.get` (<SourceRef path="compose/pregel.go:55" />) is ready as long as there's a value:
+
+```go
+func (ch *pregelChannel) get(...) (any, bool, error) {
+    if len(ch.Values) == 0 {
+        return nil, false, nil      // no upstream arrived -> not ready
+    }
+    // ...ready if there's a value; if multiple upstreams arrived, it calls mergeValues internally
+}
+```
+
+**The fan-in node can fire the moment any upstream arrives** — only if multiple upstreams arrive within the same super-step does it call `mergeValues`. This is also why Pregel tolerates cycles: the single value delivered by the back edge is enough to fire the node again.
+
+DAG's `dagChannel.get` (<SourceRef path="compose/dag.go:128" />) is the opposite, waiting for **all** predecessors to be settled:
+
+```go
+for _, state := range ch.ControlPredecessors {
+    if state == dependencyStateWaiting {
+        return nil, false, nil      // a predecessor still waiting -> not ready
+    }
+}
+for _, ready := range ch.DataPredecessors {
+    if !ready {
+        return nil, false, nil      // a data predecessor hasn't arrived -> not ready
+    }
+}
+```
+
+**Fire only when all predecessors are settled**, while unchosen branches use skip propagation to explicitly "skip," so downstream never waits forever. Back to the parallel-research example: with the default Pregel, `merge` may fire once when `web` arrives first; if you want "aggregate only after both web and kb arrive," you should use `AllPredecessor` (DAG). **The same graph topology, with a different trigger mode, gives completely different fan-in behavior.**
+
+## Finer-grained fan-in: Workflow's field-level mapping
+
+Graph's fan-in is "merge whole outputs"; Workflow drops the granularity to **field level**, via `FieldMapping` (<SourceRef path="compose/field_mapping.go:31" />):
+
+```go
+type FieldMapping struct {
+    fromNodeKey     string   // which upstream node it comes from
+    from            string   // which field/key of the upstream output
+    to              string   // which field/key of the downstream input it maps to
+    customExtractor func(input any) (any, error)
+}
+```
+
+With it, you can declare "wire upstream A's `Summary` field + upstream B's `Score` field onto two separate downstream inputs." This is why Workflow forces DAG mode (Chapter 20): field-level fan-in must wait for all relevant upstreams to arrive before assembling the fields into the downstream's complete input structure. **From Graph's "merge the whole" to Workflow's "wire by field," fan-in's expressiveness is refined further, but underneath it's still the "wait-for-all + merge" skeleton.**
+
+<Callout kind="key" title="The design key for this chapter">
+Both ends of parallelism reduce to a core function: fan-out = `copyItem` (values share a reference, streams copy-on-read), fan-in = `mergeValues` (maps by key-union, streams by arrival order). And the orthogonal question of "how many upstreams a fan-in node waits for" is pushed down to the swappable channel strategy (Pregel any / DAG all+skip). **How data is copied, how it's merged, and when it fires are three decoupled concerns** — precisely because they're decoupled, the same copyItem/mergeValues can serve Pregel, DAG, and Workflow orchestration alike, differing only in "when to fire" and "at what granularity to merge."
+</Callout>
+
+<Callout kind="tip" title="Try it">
+Run the parallel-research graph twice: first with the default Pregel, then passing `compose.WithNodeTriggerMode(compose.AllPredecessor)` at compile time. Observe the difference in how many times and when `merge` is invoked. Then deliberately make `web` and `kb` return maps with the **same key**, and watch `mergeValues` return the `duplicated key` error — then ask: if what you actually want is "results partitioned by source," how would you rename keys to avoid the clash?
+</Callout>
+
+## Chapter summary
+
+- Parallelism has two ends: **fan-out** (one output feeds many downstreams) and **fan-in** (many upstreams converge on one downstream), reducing to `copyItem` and `mergeValues` respectively.
+- **Fan-out** `copyItem` (<SourceRef path="compose/graph_run.go:1020" />): a plain value **shares a reference** (zero-copy, downstream must be read-only), a stream goes **copy-on-read** (<SourceRef path="schema/stream.go:837" />, shared linked list + per-copy cursor, zero re-pull).
+- **Fan-in** `mergeValues` (<SourceRef path="compose/values_merge.go:39" />): maps take a **key-union** (<SourceRef path="internal/merge.go:62" />, a key clash returns an error rather than overwriting), multiple streams combine into an **arrival-ordered** `multiStreamReader` (<SourceRef path="schema/stream.go:538" />).
+- **How many upstreams a fan-in node waits for** is decided by the trigger mode: Pregel (<SourceRef path="compose/pregel.go:55" />) fires on any arrival, tolerates cycles; DAG (<SourceRef path="compose/dag.go:128" />) fires only when all are settled, propagates skip.
+- Workflow uses `FieldMapping` (<SourceRef path="compose/field_mapping.go:31" />) to refine fan-in to the **field level**, and therefore forces DAG.
+- The design key: **copy/merge/trigger are three decoupled concerns**, letting one copyItem/mergeValues be reused across Pregel/DAG/Workflow.
+
+That covers both ends of the compose engine's "parallelism." Next chapter we return to the interrupt thread and look at the graph engine's own Checkpoint and resume: how the Interrupt family targets a location, how gob serializes state, and how the three Resume siblings "pick up" a half-run graph precisely where it left off.

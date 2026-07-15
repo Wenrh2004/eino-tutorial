@@ -1,0 +1,57 @@
+## 流式的两难
+
+做 LLM 应用,你迟早会遇到这个两难:同一个处理逻辑,有时需要**一次拿到完整结果**(比如做判断),有时又需要**流式逐块输出**(比如打字机效果)。如果每个组件都要为「流式」和「非流式」各写一遍,代码量翻倍,还容易两边不一致。
+
+Eino 的编排引擎用一个抽象根除了这个两难。先看它怎么工作:
+
+<Viz name="runnable-paradigm" />
+
+## Runnable:四个方法,一个矩阵
+
+编排引擎里一切可执行单元都实现 `Runnable[I, O]` 接口(见 <SourceRef path="compose/runnable.go:32" />)。它暴露四个方法,恰好铺满「输入 × 输出」各自「单值 / 流」的 2×2 矩阵:
+
+| 方法 | 输入 | 输出 |
+| --- | --- | --- |
+| `Invoke` | 单值 | 单值 |
+| `Stream` | 单值 | 流 |
+| `Collect` | 流 | 单值 |
+| `Transform` | 流 | 流 |
+
+关键问题来了:**难道每个组件都要实现全部四个方法吗?** 不。绝大多数组件只实现其中**一个**——它最自然的那个。剩下三个,由框架自动补齐。
+
+## 自动降级:两个原语撑起四种范式
+
+框架怎么用「一个实现」服务「四种调用」?靠两个流处理原语(见 <SourceRef path="compose/runnable.go:345" />):
+
+- **装箱(box)**:`StreamReaderFromArray` 把一个单值包成「只有一个元素的流」。
+- **拼接(concat)**:`concatStreamReader` 把一个流折叠拼接成一个单值。
+
+有了这两个原语,任意「请求的范式」都能适配到「实际实现的范式」。看演示里最极端的一步:调用方要 `Transform`(流入流出),而组件只实现了 `Invoke`(单入单出)。框架的做法是:
+
+1. 把输入流 **concat** 成单值;
+2. 喂给 `Invoke`,拿到单值输出;
+3. 把输出单值 **box** 成流返回。
+
+一进一出各加一层适配,`Invoke` 就冒充成了 `Transform`。
+
+<Callout kind="key" title="本章的设计钥匙">
+组件作者只需实现**最自然的那一个范式**,框架用 box / concat 两个原语,沿着「能力降级链」把它适配成其余三个。**流式不再是每个组件的负担,而是编排层的通用能力。**
+</Callout>
+
+## 能力有高低:Transform 是最强实现点
+
+这套适配不是任意方向都无损的。反过来想:如果一个组件原生实现了 `Transform`(真正的流入流出),它能不能服务 `Invoke` 的调用?能——把单值 box 成流喂进去,再把输出流 concat 成单值即可。
+
+所以四个范式构成一条**能力偏序**:`Transform` 最强(能降级服务其余三者),`Invoke` 最基础。当你追求极致的流式体验(比如首字延迟最低),就该亲手实现 `Transform`;当你只关心逻辑正确、不在乎流式,实现 `Invoke` 即可,框架会替你补齐流式外观。
+
+<Callout kind="note" title="这对 ADK 意味着什么">
+ADK 里 Agent 的事件流之所以能「既是流又能被聚合」,正是站在这套 Runnable 适配之上。第 8 章讲的 `MessageVariant`「承载一条物化消息或一条活流」,底层依赖的就是 box / concat 这对原语。上层的优雅,来自下层这层不起眼的装箱与拼接。
+</Callout>
+
+## Lambda:把普通函数变成 Runnable
+
+你自己的业务逻辑怎么接进来?通过 Lambda(见 <SourceRef path="compose/types_lambda.go" />)。你提供一个普通 Go 函数,声明它实现了哪个范式,框架就把它包装成完整的 `Runnable`,其余三个范式自动补齐。这是把「你的代码」接入编排图最轻量的方式。
+
+<Callout kind="tip" title="动手">
+打开 <SourceRef path="compose/runnable.go:345" />,找到 `newRunnablePacker` 附近的降级链构造逻辑。跟着读一遍:当只有 `Invoke` 可用时,`Stream` / `Collect` / `Transform` 分别是怎么被合成出来的?对照上面演示的第 2、3、4 步验证你的理解。
+</Callout>

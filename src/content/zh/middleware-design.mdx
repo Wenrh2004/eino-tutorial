@@ -1,0 +1,119 @@
+## 从"会用"到"看懂设计"
+
+第 6 章你已经会叠中间件了。这一章我们回到设计层面,回答三个"为什么":为什么 ADK 有**两套**中间件类型?九个钩子为什么这样切?十几个内置件如何归类?看懂这些,你就能判断"该用哪套、该实现哪个钩子、该往哪层塞逻辑"。
+
+## 两套中间件:struct vs interface 的世代之争
+
+翻开源码你会发现 ADK 里并存两种中间件:老的 `AgentMiddleware`(<SourceRef path="adk/chatmodel.go:239" />)是一个**结构体**,新的 `TypedChatModelAgentMiddleware[M]`(<SourceRef path="adk/handler.go:139" />)是一个**接口**。这不是重复造轮子,而是一次有意的世代升级。
+
+老的结构体版长这样:
+
+```go
+type AgentMiddleware struct {
+    AdditionalInstruction string
+    AdditionalTools       []tool.BaseTool
+    BeforeChatModel func(context.Context, *ChatModelAgentState) error
+    AfterChatModel  func(context.Context, *ChatModelAgentState) error
+    WrapToolCall    compose.ToolMiddleware
+}
+```
+
+它简单,但源码在 <SourceRef path="adk/handler.go:117" /> 直白地列出了它的**天花板**:
+
+- **结构体是封闭的**:用户无法给它加新方法来扩展能力。
+- **框架只认它的固定字段**:哪怕你内嵌它、加了自己的方法,框架也调不到——因为 `config.Middlewares` 的类型是 `[]AgentMiddleware`,不是你的类型。
+- **回调只能返回 `error`**:改不了 `context`,没法把修改后的上下文往下传。
+
+<Callout kind="key" title="本章的设计钥匙">
+从 struct 升级到 interface,本质是把中间件从"**填空题**"变成"**开放实现**"。结构体版让你填几个预定义的字段(封闭、有限);接口版让你**实现一个类型**——可以带任意内部状态和方法,钩子还能返回修改后的 `context` 往下传播。这正是"面向接口而非实现"在框架扩展点上的体现:框架只依赖接口,把"能扩展成什么样"的权力完全交给你。结构体版被保留只为向后兼容,新代码一律用接口版。
+</Callout>
+
+## 为什么钩子返回 context 如此重要
+
+接口版每个钩子都返回 `(context.Context, ..., error)`,而不是只返回 `error`。这个细节是整套设计的枢纽。
+
+想象一个链路追踪中间件:它在 `BeforeModelRewriteState` 里往 `ctx` 里塞一个 span,后续的模型调用、工具执行都该看到这个 span。如果钩子不能返回 `ctx`,你塞进去的东西就断在原地,传不下去。接口版通过"钩子返回新 `ctx`、`Wrap` 包裹链传递 `ctx`"(<SourceRef path="adk/handler.go:124" />),让上下文能在整条调用链上连续流动。这是结构体版的 `func(...) error` 永远做不到的。
+
+## 九个钩子的分类学
+
+第 6 章列过九个钩子,这里我们按"作用对象 × 时机"给它们建一张坐标图,理解切法背后的意图:
+
+| 层级 | 钩子 | 类型 | 用途 |
+| --- | --- | --- | --- |
+| Agent | `BeforeAgent` / `AfterAgent` | 观测·改写 | 进入前改指令/工具集,成功收尾时观测 |
+| 模型 | `BeforeModelRewriteState` / `AfterModelRewriteState` | 观测·改写(**持久化**) | 每次调模型前后改消息/工具,改动进 state |
+| 工具 | `WrapInvokableToolCall` 等四个 | 包裹 | 围绕一次工具执行插逻辑 |
+| 模型调用 | `WrapModel` | 包裹 | 围绕模型调用本身:重试/降级/发事件 |
+
+切法的意图有三条线索:
+
+1. **`Before/After`(钩子)vs `Wrap`(包裹)**。前者是"在某个时刻被叫一下",适合观测和改状态;后者给你原始端点、你返回一个新端点,适合"在调用前后都插手"的洋葱式逻辑。
+2. **持久化边界**。`BeforeModelRewriteState` 的改动会写进 state、影响后续迭代;而 `WrapModel` 的改动只作用于单次调用。这条边界决定了"改消息去哪改"——源码在 <SourceRef path="adk/handler.go:254" /> 明确劝退在 `WrapModel` 里改输入,因为它不持久化、还打断 prompt 缓存。
+3. **工具钩子为何有四个**。标准/增强 × 同步/流式,共四个 `Wrap*ToolCall`。因为工具有两代接口(裸字符串 vs 结构化 `ToolArgument`)和两种执行模式(同步 vs 流式),框架为每种组合都留了精确的包裹点,而不是用一个笼统的钩子糊过去。
+
+## 执行序:一张必须记住的时序图
+
+多个中间件 + 框架内部逻辑叠在一起,顺序不能靠猜。源码在 <SourceRef path="adk/chatmodel.go:323" /> 给出了权威的**模型调用生命周期**(从最外层到最内层):
+
+```text
+1. AgentMiddleware.BeforeChatModel        (老·钩子)
+2. ChatModelAgentMiddleware.BeforeModelRewriteState (新·钩子,可改 state)
+3. failoverModelWrapper                    (内部·多模型故障切换)
+4. retryModelWrapper                       (内部·重试)
+5. eventSenderModelWrapper                 (内部·发送模型事件)
+6. ChatModelAgentMiddleware.WrapModel      (新·包裹,先注册=最外层)
+7. callbackInjectionModelWrapper           (内部·注入回调)
+8. Model.Generate/Stream                   ← 真正的模型调用
+9. ChatModelAgentMiddleware.AfterModelRewriteState (新·钩子)
+10. AgentMiddleware.AfterChatModel          (老·钩子)
+```
+
+<Mermaid title="模型调用生命周期:老 Middlewares 包着新 Handlers" chart={`
+flowchart TB
+  subgraph OLD["老 AgentMiddleware（最外层）"]
+    B1["1 BeforeChatModel"]
+    subgraph NEW["新 Handlers"]
+      B2["2 BeforeModelRewriteState（改 state）"]
+      subgraph INT["框架内部 wrapper（洋葱）"]
+        W1["3 failover → 4 retry → 5 eventSender"]
+        W2["6 WrapModel（先注册=最外）"]
+        W3["7 callbackInjection"]
+        CALL["8 Model.Generate/Stream ← 真正调用"]
+        W1 --> W2 --> W3 --> CALL
+      end
+      A2["9 AfterModelRewriteState"]
+    end
+    A1["10 AfterChatModel"]
+  end
+  B1 --> B2 --> INT --> A2 --> A1
+`} />
+
+
+三条纪律从这张图里跳出来:
+
+- **老 `Middlewares` 包在新 `Handlers` 外面**。`BeforeChatModel`(第 1 步)先于 `BeforeModelRewriteState`(第 2 步);对称地,`AfterChatModel`(第 10 步)最后收尾。文档在 <SourceRef path="adk/chatmodel.go:320" /> 明确:Handlers 在 Middlewares 之后处理。
+- **先注册 = 最外层**。多个 `WrapModel` 按注册顺序 `[A, B, C]` 组成 `A(B(C(model)))`(<SourceRef path="adk/chatmodel.go:349" />)。想让某件事最后看到原始输出,就把它注册在最内层——`EventSenderModelWrapper` 就是这么用的。
+- **框架内部件也在链上**。重试、故障切换、事件发送不是散落的 if,而是作为一层层 wrapper 精确排在你的中间件之间。工具调用有一条对称的生命周期(<SourceRef path="adk/chatmodel.go:356" />)。
+
+<Callout kind="note" title="跨件与跨中断传值">
+中间件之间、乃至跨中断续跑传数据,用 `SetRunLocalValue`(<SourceRef path="adk/handler.go:338" />)/ `GetRunLocalValue`(<SourceRef path="adk/handler.go:366" />)。值绑定到"当前这次 Run",并会被序列化进 checkpoint——所以它天然兼容第 5 章的 HITL。要发自定义事件到事件流,用 `SendEvent`(<SourceRef path="adk/handler.go:425" />)。
+</Callout>
+
+## 内置件的两类职责
+
+`adk/middlewares/` 下的内置件不是随意堆砌,按职责能清晰分成两类:
+
+- **给能力(注入工具)**:`filesystem`(<SourceRef path="adk/middlewares/filesystem/filesystem.go:395" />,文件读写/grep/glob)、`plantask`(任务清单)、`skill`(加载 SKILL.md)、`toolsearch`(动态工具检索)。它们的共性是往 Agent 里**加工具**,扩展"能做什么"。
+- **管上下文(改写状态)**:`summarization`(超长历史摘要压缩)、`reduction`(两阶段截断/清理工具输出)、`agentsmd`(临时注入 Agents.md)、`patchtoolcalls`(修补悬空的工具调用)。它们的共性是在 `Before/AfterModelRewriteState` 里**改消息**,管理"喂给模型什么"。
+
+这个二分不是我们硬套的,而是钩子设计逼出来的结果:`BeforeAgent` 改工具集 → 天然承载第一类;`BeforeModelRewriteState` 改消息 → 天然承载第二类。**能力从工具进,上下文从状态改**——记住这条,你一眼就能判断一个新需求该做成哪类中间件、实现哪个钩子。
+
+## 本章小结
+
+- ADK 有两套中间件:老 `AgentMiddleware`(struct,封闭)与新 `TypedChatModelAgentMiddleware[M]`(interface,开放)。新代码用接口版,结构体版仅为兼容。
+- 升级的本质是"填空 → 开放实现";接口版钩子返回 `context`,让上下文能沿整条调用链传播。
+- 九个钩子按"层级 × 时机"分:Agent / 模型(持久化)/ 工具 / 模型调用;`Before/After` 是钩子,`Wrap*` 是洋葱包裹。
+- 执行序有权威时序图:老 Middlewares 包在新 Handlers 外,先注册=最外层,框架内部件(重试/切换/事件)也在链上。
+- 内置件分两类:**给能力**(注入工具)与**管上下文**(改写状态),对应两组钩子。
+
+理解了单个 Agent 的扩展模型,下一章我们上升到**多智能体的组合范式**:supervisor、plan-execute、DeepAgent 各代表一种把 Agent 拼起来的哲学。

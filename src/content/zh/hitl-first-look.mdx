@@ -1,0 +1,91 @@
+## 当 Agent 需要「等一个人」
+
+有些动作不能让 Agent 自作主张:退款、发邮件、删数据、下订单。理想的流程是——Agent 跑到这一步,**暂停**,把「我想执行 approve(退款 ￥500)」交给人类审批,人点了同意,再**从暂停处继续**,仿佛从未停过。
+
+这就是人在回路(HITL)。它对框架的要求很苛刻:暂停时要能把「整轮运行状态」完整保存下来(可能进程都退出了),恢复时要能精确还原到那个节点。Eino 把这套能力做成了一等公民。先看它的完整闭环:
+
+<Viz name="checkpoint-resume" />
+
+对照演示,一次 HITL 走过七个阶段:正常运行 → 中断 → 持久化 → 等待 → 恢复 → 继续 → 完成。注意图里的两条流:**横向**是控制流沿节点前进,**纵向**是同一份状态被序列化到 checkpoint、再反序列化还原。它们在中断的那个节点(`ApprovalTool`)交汇——这正是理解 HITL 的钥匙。
+
+## 中断不是错误,是「合法的暂停」
+
+新手的第一反应是用 `error` 表达「需要人工介入」。Eino 明确反对:中断是一种**正常的控制流**,不是异常。
+
+工具在需要人介入时,调用 `Interrupt` 或 `StatefulInterrupt`(<SourceRef path="adk/interrupt.go" />):
+
+```go
+// 无内部状态需要保存
+func Interrupt(ctx context.Context, info any) *AgentEvent
+
+// 同时保存 agent 的内部 state,恢复时还原
+func StatefulInterrupt(ctx context.Context, info any, state any) *AgentEvent
+```
+
+`info` 是给人看的:「我要退款 ￥500,请审批」。区别在于:`StatefulInterrupt` 还会把 `state` 序列化保存,恢复时原样还给你——当你的工具在暂停前算了一半、需要接着算时用它。
+
+它们返回的不是 `error`,而是一个带 `Action.Interrupted` 的 `AgentEvent`(<SourceRef path="adk/interrupt.go:59" />)。回忆第 1 章:`AgentAction` 把控制流建模成数据,`Interrupted` 就是其中一个动作。因为它是数据而非异常,才能被 Runner 捕获、序列化、跨进程存活。
+
+<Callout kind="key" title="本章的设计钥匙">
+把「暂停」建模成一个 **Action(数据)** 而不是一个 **error(异常)**,是整个 HITL 机制的地基。异常只能被 `catch`,而数据可以被**序列化**。正因为中断是数据,Runner 才能把它连同整轮状态 `gob` 编码进 checkpoint,让运行真正「冻结」下来——哪怕进程退出。
+</Callout>
+
+## Checkpoint:把整轮状态冻起来
+
+中断发生后,Runner 会把整轮运行状态——channel 值、各节点 state、以及**定位用的 Address**——用 `gob` 序列化,写进 `CheckPointStore`。
+
+`Address` 是关键:它记录「运行是在哪个节点暂停的」。恢复时靠它精确找回中断点,而不是从头重跑。这套地址机制底层来自 compose 引擎(第 23 章详解),ADK 通过一个 `bridgeStore`(<SourceRef path="adk/interrupt.go:315" />)把两层的 checkpoint 桥接起来。
+
+要开启持久化,只需给 Runner 配一个 store,并在运行时带上 checkpoint id:
+
+```go
+runner := adk.NewRunner(ctx, adk.RunnerConfig{
+    Agent:           myAgent,
+    CheckPointStore: myStore, // 你的实现,或内存版
+})
+
+iter := runner.Query(ctx, "帮我给这笔订单退款",
+    adk.WithCheckPointID("session-42"))
+```
+
+状态落盘后,进程可以安全退出。用户去审批、隔天再回来都行——checkpoint 静静躺在 store 里,不占任何运行资源。
+
+## Resume:从断点无缝继续
+
+人审批通过后,用同一个 checkpoint id 调 `Resume` 系列方法(<SourceRef path="adk/runner.go" />):
+
+```go
+// 策略一:恢复全部中断点(最常用)
+iter, err := runner.Resume(ctx, "session-42")
+
+// 策略二:精确指定要恢复哪些、喂什么数据
+iter, err := runner.ResumeWithParams(ctx, "session-42", &adk.ResumeParams{
+    Targets: map[string]any{
+        "ApprovalTool": "approved", // 按 Address 定位,注入审批结果
+    },
+})
+```
+
+`Resume`(<SourceRef path="adk/runner.go:124" />)是「隐式恢复全部」;`ResumeWithParams`(<SourceRef path="adk/runner.go:147" />)让你按 `Address` 精确控制:`Targets` 里的地址会收到 `isResumeFlow = true` 并拿到你注入的数据,不在 `Targets` 里的中断点则自行决定如何处理。
+
+底层做的是:按 checkpoint id 反序列化出整轮状态,按 `Address` 回到当初暂停的节点,把你注入的数据交给它,然后横向的 run flow 从断点继续——就像演示里第 6 步那样,纵向的 checkpoint 流与横向的 run 流在同一个节点「接上了」。
+
+<Callout kind="note" title="三类典型 HITL 场景">
+同一套机制覆盖三种常见需求:**审批**(注入 approved/rejected)、**改参**(恢复时用 `ResumeParams` 替换工具参数)、**追问**(注入用户补充的信息)。它们的差别只是「Resume 时注入什么数据」,机制完全一致。
+</Callout>
+
+## 一个容易忽略的对称性
+
+回忆第 2 章的结论:**续跑时的流式模式来自 checkpoint,而不是调用方**。这不是孤立的细节,而是 HITL 的一条纪律:恢复必须忠实还原中断时的全部上下文——流式与否、历史消息、节点状态,一个都不能变。否则「仿佛从未暂停」就成了空话。
+
+这也解释了为什么 checkpoint 要存「整轮状态」而不只是「几个变量」:任何被遗漏的上下文,都会让恢复后的行为与暂停前产生偏差。
+
+## 本章小结
+
+- HITL 让 Agent 在关键动作前暂停、等人、再无缝继续。
+- 中断是**数据(Action)不是异常(error)**:`Interrupt` / `StatefulInterrupt` 返回带 `Interrupted` 的事件,可被序列化。
+- Checkpoint 用 `gob` 把整轮状态 + `Address` 冻结进 store,进程可安全退出。
+- `Resume` 恢复全部,`ResumeWithParams` 按 `Address` 精确注入数据;覆盖审批/改参/追问三类场景。
+- 恢复必须忠实还原全部上下文(含流式模式),这是「仿佛从未暂停」的前提。
+
+到这里,Part I 的单 Agent 主线就通了。下一章进入**中间件**:如何在不改 Agent 核心的前提下,像叠罗汉一样给它叠加文件系统、任务规划、摘要压缩等能力。

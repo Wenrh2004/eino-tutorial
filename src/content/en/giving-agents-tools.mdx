@@ -1,0 +1,120 @@
+## Tools: letting an agent *do*, not just *talk*
+
+An agent without tools can only talk. Give it tools and it can check the weather, read files, call APIs — the model decides *which tool to call and with what arguments*, and the framework *actually executes it and feeds the result back*. This chapter unpacks that contract.
+
+<Mermaid title="The model decides, the framework does the work" chart={`
+flowchart LR
+  M["Model<br/>picks a tool + args (JSON)"] -->|"ToolCall"| F["Framework · ToolsNode<br/>looks up the tool by name, runs it"]
+  F -->|"argumentsInJSON"| T["Tool impl<br/>InvokableRun / StreamableRun"]
+  T -->|"result string"| F
+  F -->|"fed back as a Tool message"| M
+`} />
+
+
+Here's what adding tools to an agent looks like:
+
+```go
+agent, _ := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+    Name:        "assistant",
+    Instruction: "You may use tools to accomplish tasks.",
+    Model:       chatModel,
+    ToolsConfig: adk.ToolsConfig{
+        ToolsNodeConfig: compose.ToolsNodeConfig{
+            Tools: []tool.BaseTool{weatherTool, searchTool},
+        },
+    },
+})
+```
+
+Notice tools are configured **declaratively** through `ToolsConfig` — the ADK has no mutable `agent.AddTool(...)`. Why? The "immutable binding" section below explains.
+
+## The three-layer tool interface
+
+The tool interfaces are defined in <SourceRef path="components/tool/interface.go" /> as a progressive three-layer design:
+
+```go
+// Layer 1: only advertise "what I am"
+type BaseTool interface {
+    Info(ctx context.Context) (*schema.ToolInfo, error)
+}
+
+// Layer 2: can be invoked synchronously
+type InvokableTool interface {
+    BaseTool
+    InvokableRun(ctx context.Context, argumentsInJSON string, opts ...Option) (string, error)
+}
+
+// Layer 3: can be invoked as a stream
+type StreamableTool interface {
+    BaseTool
+    StreamableRun(ctx context.Context, argumentsInJSON string, opts ...Option) (*schema.StreamReader[string], error)
+}
+```
+
+The layering is deliberate:
+
+- **`BaseTool` alone is enough to "tell the model this tool exists."** Choosing a tool only needs the schema (name, description, params), not the ability to execute. So a tool implementing only `BaseTool` can still be passed to a model via `WithTools`.
+- To actually **execute**, you need `InvokableTool` (returns a string synchronously) or `StreamableTool` (returns a stream).
+- Arguments arrive as a **JSON string** (`argumentsInJSON`), and the return is a string too. That's the boundary between the model world and the Go world: the model emits JSON, the tool receives JSON.
+
+<Callout kind="note" title="There are enhanced variants too">
+The source also has `EnhancedInvokableTool` / `EnhancedStreamableTool` (<SourceRef path="components/tool/interface.go:67" />), which replace raw strings with structured `*schema.ToolArgument` / `*schema.ToolResult` for multimodal support. When a tool implements both a standard and an enhanced interface, ToolsNode prefers the enhanced one. The standard variants are fine to start.
+</Callout>
+
+## ToolInfo: what the model actually "sees"
+
+The model has no idea what your Go function looks like — it only sees `ToolInfo` (defined in `schema/tool.go`):
+
+```go
+type ToolInfo struct {
+    Name string             // unique name
+    Desc string             // when/why to use it — written for the model
+    Extra map[string]any
+    *ParamsOneOf            // parameter schema; nil means no parameters
+}
+```
+
+`ParamsOneOf` has two forms (the `schema/tool.go` counterpart of <SourceRef path="components/tool/interface.go" />): either handwrite params as a `map[string]*ParameterInfo`, or hand it a JSON Schema directly. Each `ParameterInfo` carries `Type` / `Desc` / `Required` / `Enum` and the like, which get assembled into the tool definition sent to the model.
+
+**`Desc` is what makes or breaks correct tool invocation**: it is the model's only basis for deciding *when* to use a tool. "Check the weather" versus "Given a city name and date, look up the future forecast; input the city name" produce wildly different invocation accuracy.
+
+## Why tool binding is immutable
+
+The model-side interface for binding tools is around <SourceRef path="components/model/interface.go:95" /> — `ToolCallingChatModel`:
+
+```go
+type ToolCallingChatModel interface {
+    BaseChatModel
+    WithTools(tools []*schema.ToolInfo) (ToolCallingChatModel, error)
+}
+```
+
+The key is the return value: `WithTools` **returns a new model instance** rather than mutating the original. The docs say this is explicitly for concurrency safety — you can share one base model across goroutines and derive a fresh instance with a different tool set on each `WithTools` call, with no interference.
+
+Contrast the deprecated old interface `ChatModel.BindTools(...) error`: it **mutates the receiver in place**, and is therefore racy — hence its deprecation.
+
+<Callout kind="key" title="The design key for this chapter">
+"Immutable binding returns a new instance" is a discipline that runs through all of Eino. What it buys you is **shareability, composability, and freedom from data races**: one base model can be safely reused by many agents. It also explains why `ToolsConfig` is declarative — the tool set is fixed at agent construction, not a mutable runtime field. Mutability is the enemy of concurrency, and Eino keeps it out the door by deriving new instances.
+</Callout>
+
+At runtime, ChatModelAgent feeds tools to the model through exactly this option (<SourceRef path="adk/chatmodel.go" />): it collects every tool's `Info` and passes `model.WithTools(toolInfos)` when calling the model. You write `Tools` in the Config, the framework translates it into `WithTools` at run time — that's the full path behind "ChatModelAgent configures tools via `model.WithTools`."
+
+## Two "special tools": Exit and returnDirectly
+
+Two tool-related mechanisms are easy to confuse:
+
+**The Exit tool is not auto-injected.** Only if you set `Exit` in the Config (<SourceRef path="adk/chatmodel.go:295" />) will the framework add it to the tool set and generate Exit actions; leave it unset and there is none. The ADK ships a ready-made `ExitTool` (<SourceRef path="adk/chatmodel.go:597" />) that takes a `final_result` argument and emits `NewExitAction()` to end the run when called.
+
+**returnDirectly** means "call and return": normally a tool's result is fed back to the model to continue the loop, but if a tool's name is listed in `ToolsConfig.ReturnDirectly` (<SourceRef path="adk/chatmodel.go:141" />), then as soon as it's called the agent returns that result as the final output without going back to the model. Handy for tools whose "last step is to perform an action."
+
+Worth noting: the framework **automatically** adds two entries to `returnDirectly` — the transfer tool and the Exit tool (the runtime logic tied to <SourceRef path="adk/chatmodel.go:141" />). Both of those are inherently "call and terminate the current flow."
+
+## Chapter summary
+
+- Tools let an agent *do things*; configure them **declaratively** through `ToolsConfig` — there is no mutable AddTool.
+- The tool interface has three layers: `BaseTool` (description only) → `InvokableTool` (sync) → `StreamableTool` (stream); arguments cross a JSON-string boundary.
+- `ToolInfo` is what the model sees; `Desc` directly determines invocation accuracy.
+- Tool binding `WithTools` **returns a new instance** (immutable), buying concurrency safety and composability.
+- The `Exit` tool must be configured explicitly; `returnDirectly` makes a tool "call and return," and transfer/exit are added to it automatically.
+
+Next, we give the agent memory — how the session passes values across steps, how history is maintained, and how the event stream becomes SSE.

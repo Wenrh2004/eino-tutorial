@@ -1,0 +1,49 @@
+## The streaming dilemma
+
+Build LLM apps long enough and you hit this dilemma: the same logic sometimes needs the **complete result at once** (to make a decision) and sometimes needs to **stream chunk by chunk** (for a typewriter effect). If every component must implement both "streaming" and "non-streaming", code doubles and the two paths drift apart.
+
+Eino's orchestration engine dissolves this with one abstraction.
+
+<Viz name="runnable-paradigm" />
+
+## Runnable: four methods, one matrix
+
+Every executable unit in the engine implements `Runnable[I, O]` (see <SourceRef path="compose/runnable.go:32" />). It exposes four methods that tile the "input × output" over "single / stream" 2×2 matrix:
+
+| Method | Input | Output |
+| --- | --- | --- |
+| `Invoke` | single | single |
+| `Stream` | single | stream |
+| `Collect` | stream | single |
+| `Transform` | stream | stream |
+
+The key question: must every component implement all four? No. Most implement just **one** — the most natural. The framework synthesizes the rest.
+
+## Auto-downgrade: two primitives power four paradigms
+
+How does "one implementation" serve "four calls"? Two stream primitives (see <SourceRef path="compose/runnable.go:345" />):
+
+- **box** — `StreamReaderFromArray` wraps a single value into a one-element stream.
+- **concat** — `concatStreamReader` folds a stream into a single value.
+
+With these, any *requested* paradigm adapts to the one *implemented* paradigm. Take the extreme step in the demo: the caller wants `Transform` (stream→stream) but the component only implements `Invoke`. The framework concats the input stream to a single value, runs `Invoke`, then boxes the output back to a stream.
+
+<Callout kind="key" title="The design key of this chapter">
+A component author implements only the **most natural paradigm**; the framework adapts it to the other three along a "capability downgrade chain" using box / concat. **Streaming stops being every component's burden and becomes an orchestration-layer capability.**
+</Callout>
+
+## Capability has an ordering: Transform is strongest
+
+The four paradigms form a partial order: `Transform` is strongest (it can downgrade to serve the other three), `Invoke` is most basic. Chase the best streaming experience (lowest time-to-first-token) → implement `Transform` yourself. Only care about correctness → implement `Invoke` and let the framework paint on the streaming facade.
+
+<Callout kind="note" title="What this means for the ADK">
+The ADK's agent event stream can be "both a stream and aggregatable" precisely because it stands on this Runnable adaptation. The `MessageVariant` from Chapter 8 that "carries a materialized message or a live stream" relies on exactly this box / concat pair.
+</Callout>
+
+## Lambda: turn a plain function into a Runnable
+
+You wire in your own logic via Lambda (see <SourceRef path="compose/types_lambda.go" />): supply a plain Go function, declare which paradigm it implements, and the framework wraps it into a full `Runnable` with the other three auto-filled — the lightest way to join the orchestration graph.
+
+<Callout kind="tip" title="Try it">
+Open <SourceRef path="compose/runnable.go:345" /> and find the fallback-chain construction logic around `newRunnablePacker`. Read through it: when only `Invoke` is available, how are `Stream` / `Collect` / `Transform` each synthesized? Verify your understanding against steps 2, 3, and 4 demonstrated above.
+</Callout>

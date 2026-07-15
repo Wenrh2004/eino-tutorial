@@ -1,0 +1,170 @@
+## 打开引擎盖
+
+Part I 你学会了**用** ADK,Part II 你理解了它**为什么**这样设计。现在进入 Part III:当你写下 `runner.Query(ctx, "...")` 那一行,引擎盖下到底发生了什么?
+
+答案会颠覆一点直觉——你在 Part I 见到的所有 Agent(`ChatModelAgent`、`supervisor`、`DeepAgent`),运行时其实都被悄悄换成了**同一种内部类型**:`flowAgent`。而 `Runner` 本身,薄得几乎不像一个"运行时"。这一章我们就把这层骨架拆开看清楚。
+
+<Mermaid title="薄 Runner + 统一的 flowAgent 骨架" chart={`
+flowchart TB
+  subgraph USER["你写的 Agent"]
+    CMA["ChatModelAgent"]
+    SUP["supervisor"]
+    DA["DeepAgent"]
+  end
+  CMA --> TF["toFlowAgent(ctx, agent)"]
+  SUP --> TF
+  DA --> TF
+  TF --> FA["flowAgent<br/>嵌入原 Agent + 协作状态<br/>subAgents / parent / historyRewriter"]
+  R["Runner（薄外壳）<br/>标准化输入 · 转 flowAgent · checkpoint"] --> TF
+  FA --> ITER["AsyncIterator 事件流"]
+`} />
+
+
+## Runner:薄薄一层泛型外壳
+
+先看 `Runner`。它的真身是一个泛型结构 `TypedRunner[M]`(<SourceRef path="adk/runner.go:55" />),只有三个字段:被运行的 Agent、是否开启流式、以及可选的 checkpoint 存储。
+
+```go
+type TypedRunner[M MessageType] struct {
+    a               TypedAgent[M]
+    enableStreaming bool
+    store           CheckPointStore
+}
+
+// 你在 Part I 一直用的 Runner,其实是它的一个具体实例化。
+type Runner = TypedRunner[*schema.Message]
+```
+
+你在前面章节反复调用的 `adk.NewRunner`(<SourceRef path="adk/runner.go:89" />)只是把 `RunnerConfig`(<SourceRef path="adk/runner.go:68" />)里的 `Agent`、`EnableStreaming`、`CheckPointStore` 塞进这个结构。至于 `Query`(<SourceRef path="adk/runner.go:108" />)和 `Run`(<SourceRef path="adk/runner.go:102" />),前者只是把字符串包成一条 user 消息再转调后者——它们都返回一个 `*AsyncIterator`,也就是你熟悉的那个"事件流"。
+
+<Callout kind="note" title='Runner 不"跑"逻辑,它只是入口'>
+Runner 里没有任何 ReAct 循环、没有工具调度、没有 transfer 判断。它的职责只有三件:标准化输入、把 Agent 转成 `flowAgent`、以及在中断时负责 checkpoint 的读写。真正的运行骨架在 `flowAgent` 里。
+</Callout>
+
+## 关键一步:toFlowAgent 统一包裹
+
+`Run` 内部做的第一件实质工作,是把你传入的 Agent 交给 `toFlowAgent`(调用点在 <SourceRef path="adk/runner.go:167" />,实现在 <SourceRef path="adk/flow.go:104" />):
+
+```go
+func toFlowAgent(ctx context.Context, agent Agent, opts ...AgentOption) *flowAgent {
+    var fa *flowAgent
+    var ok bool
+    if fa, ok = agent.(*flowAgent); !ok {
+        fa = &flowAgent{Agent: agent}   // 普通 Agent:包一层
+    } else {
+        fa = fa.deepCopy()              // 已经是 flowAgent:深拷贝一份
+    }
+    // ...补上默认的 historyRewriter
+    return fa
+}
+```
+
+这段代码朴素得容易忽略,但它是整套多智能体机制的地基。`flowAgent`(<SourceRef path="adk/flow.go:42" />)通过**嵌入** `Agent` 接口,保留了原 Agent 的全部行为,同时给它挂上了协作所需的额外状态:
+
+```go
+type flowAgent struct {
+    Agent                              // 嵌入:原 Agent 的能力原样保留
+
+    subAgents   []*flowAgent           // 它的下属
+    parentAgent *flowAgent             // 它的上级
+
+    disallowTransferToParent bool
+    historyRewriter          HistoryRewriter
+    checkPointStore          compose.CheckPointStore
+}
+```
+
+<Callout kind="key" title="本章的设计钥匙">
+`flowAgent` 是一个**装饰器(decorator)**:它嵌入原 Agent、原样转发核心行为,只额外接管"协作"这一层——父子关系、RunPath、事件记录、transfer。这就是为什么 supervisor、DeepAgent、单个 ChatModelAgent 在运行时能被一视同仁:无论你写的是哪种 Agent,进入引擎前都会被 `toFlowAgent` 归一成同一种结构。**"用户可见的 Agent 千姿百态,引擎内部只认一种"**——正是这层归一,让取消、中断、续跑、事件记录这些机制只需实现一遍,就对所有 Agent 生效。
+</Callout>
+
+## flowAgent.run():真正的骨架
+
+`flowAgent.Run`(<SourceRef path="adk/flow.go:352" />)是外层入口:它先 `initRunCtx` 建立本次运行的上下文,再用 `AppendAddressSegment` 把自己的名字追加到"地址"上(<SourceRef path="adk/flow.go:357" />),准备好输入后,起一个 goroutine 去跑内层的 `run`(<SourceRef path="adk/flow.go:478" />)。真正的循环骨架在这个内层方法里,它干三件事。
+
+**第一,维护 RunPath。** 每个从 Agent 流出的事件,如果还没有归属,就盖上当前 Agent 的名字和运行路径(<SourceRef path="adk/flow.go:513" />):
+
+```go
+if len(event.RunPath) == 0 {
+    event.AgentName = a.Name(ctx)
+    event.RunPath = runCtx.RunPath
+}
+```
+
+RunPath 就是一条"事件从哪条 Agent 链上流出来"的轨迹——它既是可观测性的基础,也是下一章 checkpoint 能精确定位"停在哪"的坐标。
+
+**第二,把事件录进 session。** 注意这里有一条克制的记录策略(<SourceRef path="adk/flow.go:519" />):只有 `Action` 为空或非中断、且 RunPath **精确匹配**当前 Agent 的事件,才会被复制一份存进 session。
+
+```go
+if (event.Action == nil || event.Action.Interrupted == nil) && exactRunPathMatch(runCtx.RunPath, event.RunPath) {
+    copied := copyTypedAgentEvent(event)
+    // ...
+    runCtx.Session.addEvent(copied)
+}
+```
+
+为什么要"精确匹配"?因为子 Agent、工具内部产生的事件会穿过父 Agent 流出,但它们**不属于**父 Agent 的对话历史。这条判断防止父 Agent 把下属的中间草稿误记成自己的记忆——这正是第 8 章"隔离上下文"哲学在运行时的落地。中断事件也被刻意排除在记录之外:它携带的信息要么已经呈给用户,要么会通过其他途径交给 Agent。
+
+**第三,处理 transfer。** 当一个 Agent 决定把控制权转移给另一个时,`run` 会用 `getAgent` 找到目标(<SourceRef path="adk/flow.go:557" />),直接调用它的 `Run`,并把子 Agent 的事件原样转发出去:
+
+```go
+if destName != "" {
+    agentToRun := a.getAgent(ctxForSubAgents, destName)
+    // ...
+    subAIter := agentToRun.Run(ctxForSubAgents, nil /* 子 Agent 从 runCtx 取输入 */, opts...)
+    for {
+        subEvent, ok_ := subAIter.Next()
+        if !ok_ { break }
+        generator.Send(subEvent)
+    }
+}
+```
+
+这就是第 7 章"transfer = 交接控制权 + 共享上下文"的实现:子 Agent 拿的是 `nil` 输入,因为它要从共享的 `runCtx` 里读取上下文——控制权流走了,上下文却留在原地被共享。这与第 16 章 AgentTool 的"隔离上下文"形成鲜明对照。
+
+## 环境状态:runContext 与 runSession
+
+上面反复出现的 `runCtx`,是本次运行的**环境**。它的结构(<SourceRef path="adk/runctx.go:346" />)很直白:
+
+```go
+type runContext struct {
+    RootInput        *AgentInput   // 最初的用户输入
+    RunPath          []RunStep     // 当前的 Agent 运行路径
+    AgenticRootInput any
+    Session          *runSession   // 跨 Agent 共享的会话
+}
+```
+
+其中 `runSession`(<SourceRef path="adk/runctx.go:34" />)是共享上下文的载体——它持有 `Values`(带锁的键值对,就是你在 Part I 用过的 session 存取)和事件列表。`WithSessionValues` 这类 API 最终读写的就是这里。`initRunCtx`(<SourceRef path="adk/runctx.go:386" />)在每次运行开始时把它建好,并挂进 `context.Context` 随调用链传递。
+
+## 中断时:把整个运行状态冻进 checkpoint
+
+最后一块骨架是**中断持久化**。当事件流里出现中断动作、且你在 `RunnerConfig` 里配了 `CheckPointStore`,`Runner` 会在 <SourceRef path="adk/runner.go:331" /> 调用 `runnerSaveCheckPointImpl`(<SourceRef path="adk/interrupt.go:283" />),把当下的运行现场用 `gob` 序列化后写入存储:
+
+```go
+err := gob.NewEncoder(buf).Encode(&serialization{
+    RunCtx:              runCtx,        // 整个运行环境(含 session、RunPath)
+    Info:                info,
+    InterruptID2Address: id2Addr,       // 中断点的地址映射
+    InterruptID2State:   id2State,
+    EnableStreaming:     enableStreaming,
+})
+// ...
+return store.Set(ctx, key, buf.Bytes())
+```
+
+注意被冻进去的是**整个 `runContext`**——因为有了前面 RunPath 的精确坐标和 session 的完整快照,恢复时才能不多不少地回到中断的那一刻。这就是为什么"续跑"在 ADK 里不是特例,而是骨架自带的能力:`Resume`(<SourceRef path="adk/runner.go:124" />)和 `ResumeWithParams`(<SourceRef path="adk/runner.go:147" />)反向做这件事——把 checkpoint 里的 `runContext` 解冻,让运行从原地继续。
+
+<Callout kind="tip" title="动手">
+打开 <SourceRef path="adk/flow.go:478" /> 通读一遍 `flowAgent.run`,对照本章的"三件事":RunPath 维护、session 记录、transfer 处理。然后想一个问题:如果把"精确匹配 RunPath"这条判断去掉,父 Agent 的记忆会变成什么样?(提示:它会开始"偷听"所有子 Agent 的内心独白。)
+</Callout>
+
+## 本章小结
+
+- `Runner` 是**薄壳**(<SourceRef path="adk/runner.go:55" />):标准化输入、转 `flowAgent`、管 checkpoint 读写,不含任何运行逻辑。
+- `toFlowAgent`(<SourceRef path="adk/flow.go:104" />)把**任何** Agent 归一成 `flowAgent`(<SourceRef path="adk/flow.go:42" />)——一个嵌入原 Agent、只接管"协作层"的装饰器。这是取消/中断/记录能"一次实现、处处生效"的根因。
+- `flowAgent.run`(<SourceRef path="adk/flow.go:478" />)是真正的骨架,做三件事:维护 **RunPath**、按"精确匹配"策略把事件录进 **session**、处理 **transfer**。
+- `runContext`/`runSession`(<SourceRef path="adk/runctx.go:346" />)是跨 Agent 共享的运行环境;transfer 靠共享它来交接上下文。
+- 中断时整个 `runContext` 被 `gob` 冻进 checkpoint(<SourceRef path="adk/interrupt.go:283" />),`Resume` 反向解冻——续跑因此是骨架自带能力,而非特例。
+
+下一章我们放大其中一个 Agent 的内部:看 ReAct 如何不是一段 `for` 循环,而是一张编译好的图。

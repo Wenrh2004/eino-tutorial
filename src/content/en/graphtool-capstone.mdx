@@ -1,0 +1,106 @@
+## The start of the finale: making orchestration itself a tool
+
+We've come full circle. In Part I you learned to hang tools on an Agent; in Part IV you took apart the compose engine — now connect the two: **can a compiled Graph / Chain / Workflow, in reverse, become a tool in an Agent's hand?** It can, and it's the most beautiful self-consistency in Eino's layered design: **orchestration is the implementation of a tool, and a tool is the wrapper of orchestration.** This chapter reads through the official `graphtool` example (<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:32" />) to see how it wraps any compose artifact into a tool with interrupt capability.
+
+<Mermaid title="Compilable wraps three builders into one tool" chart={`
+flowchart TB
+  G["Graph"] --> C{"Compilable interface<br/>Compile() → Runnable"}
+  CH["Chain"] --> C
+  WF["Workflow"] --> C
+  C --> GT["InvokableGraphTool<br/>reflect-generated ToolInfo (JSON Schema)"]
+  GT -->|"hung on an Agent as a tool"| AGENT["Agent"]
+  GT -.->|"compiled per call + private checkpoint"| INT["supports nested interrupt"]
+`} />
+
+
+## One interface, swallowing three builders
+
+Last part we said Graph / Chain / Workflow share one foundation. Here's where the dividend pays out. `graphtool` needs only an extremely narrow interface, `Compilable` (<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:32" />):
+
+```go
+type Compilable[I, O any] interface {
+    Compile(ctx context.Context, opts ...compose.GraphCompileOption) (compose.Runnable[I, O], error)
+}
+```
+
+`compose.Graph`, `compose.Chain`, and `compose.Workflow` all implement `Compile` — so they are **naturally all `Compilable`**. The wrapper doesn't care which orchestration you used; it recognizes only the one thing "compiles to a Runnable." That's a clean cashing-out of "program to an interface, not an implementation" at the framework level.
+
+The wrapper itself is `InvokableGraphTool` (<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:36" />), with plain fields:
+
+```go
+type InvokableGraphTool[I, O any] struct {
+    compilable     Compilable[I, O]              // the orchestration to compile
+    compileOptions []compose.GraphCompileOption  // compile options
+    tInfo          *schema.ToolInfo              // the tool's schema
+}
+```
+
+The constructor (<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:42" />) has one key move: `utils.GoStruct2ToolInfo[I](name, desc)` — it uses reflection to **auto-translate the input type `I`, a Go struct, into the tool's JSON Schema**. You define the input struct, and the tool's parameter description is generated automatically, so the LLM knows how to fill in arguments. Note: **it does not compile the graph here** — compilation is deferred to each call.
+
+## Invoke: translating a tool call into one graph execution
+
+`InvokableRun` (<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:77" />) is the heart of the whole adaptation. What it does is essentially "translation": translate the JSON-string arguments the LLM gives into the graph's typed input; translate the graph's output back into a JSON string.
+
+```go
+func (g *InvokableGraphTool[I, O]) InvokableRun(ctx context.Context, input string,
+    opts ...tool.Option) (output string, err error) {
+    // 1. pull out call options and forcibly attach a fixed checkpoint id
+    callOpts := tool.GetImplSpecificOptions(&graphToolOptions{}, opts...).composeOpts
+    callOpts = append(callOpts, compose.WithCheckPointID(graphToolCheckPointID))
+    // 2. compile the graph freshly on every call (with a private checkpoint store)
+    // 3. Unmarshal the JSON args into the typed I
+    // 4. runnable.Invoke(ctx, inputParams, callOpts...) actually runs the graph
+    // 5. MarshalString the output back into a JSON string
+}
+```
+
+One counter-intuitive detail: **the graph is compiled fresh on every call** (around <SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:88" />), not compiled once at construction and reused. Why? Because each call must be given a **private, single-slot checkpoint store** — the key to how it carries interrupts, which we'll get to next. It's a clear-eyed trade-off: sacrifice a little compile overhead for clean interrupt isolation.
+
+<Callout kind="key" title="The design key for this chapter">
+GraphTool cashes out the "closed loop" of Eino's layering: **compose is the implementation foundation of ADK tools, and a tool is the outward wrapper of compose orchestration** — the two layers are two sides of one coin, meshed through the single narrow interface `Compilable`. More exquisite is its **three-layer relay of interrupts**: the inner graph raises an interrupt with `StatefulInterrupt`, GraphTool **packs the inner graph's checkpoint bytes into its own tool-interrupt state** and re-raises upward, and ToolsNode re-raises further to the Agent Runner carrying the tool's address. Each layer recognizes only its own state type (naturally isolated by generic `GetInterruptState[T]`), so that "a tool embeds an interruptible graph, whose node in turn needs human approval" — nested interrupts of two or even more layers — can be precisely saved and restored layer by layer. This is proof that "interrupt as a first-class citizen" runs all the way from the Agent down into the orchestration engine.
+</Callout>
+
+## The three-layer interrupt relay: how nested interrupts are saved layer by layer
+
+This is the chapter's hardest mechanism, and the real reason GraphTool exists. Picture a scenario: an Agent calls an "order approval tool," which is internally a Workflow, and a node inside the Workflow needs human confirmation. There are two layers of interrupt here — the outer tool's approval and the inner graph node's confirmation. How do they get saved and restored without interfering?
+
+**Layer one: the inner graph raises an interrupt.** A node in the graph raises an interrupt with `compose.StatefulInterrupt(ctx, info, state)`, carrying away its own local state. This is the graph-engine interrupt primitive from Part III.
+
+**Layer two: GraphTool captures and re-packs.** After the graph's `Invoke` returns an interrupt error, `InvokableRun` recognizes it with `compose.ExtractInterruptInfo(err)` (<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:121" />), then pulls the inner graph's checkpoint bytes out of that private store and re-raises with `tool.CompositeInterrupt` (<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:134" />):
+
+```go
+return tool.CompositeInterrupt(ctx, "graph tool interrupt",
+    &graphToolInterruptState{Data: data, ToolInput: input},  // inner checkpoint + original args
+    interruptErr)
+```
+
+Notice this `graphToolInterruptState` (<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:68" />) — it turns the **inner graph's checkpoint bytes** and the **original tool arguments**, together, into GraphTool's own interrupt state at this layer. The inner graph's interrupt is thus "lifted" into the outer Agent's checkpoint. It's carried by a private single-slot store (<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:303" />); the inner graph never touches the Agent's real store directly.
+
+**Layer three: ToolsNode re-raises with an address.** compose's `ToolsNode` wraps an address segment around each tool call; on detecting the tool's interrupt, it wraps it with the tool's callID as address and finally hands it to the Agent Runner as a resumable point.
+
+Each layer serializes only itself, and on resume unpacks in reverse, layer by layer. **The key is type isolation**: the outer approval wrapper's interrupt state is `string`, GraphTool's is `*graphToolInterruptState`, and `tool.GetInterruptState[T]` is generic — each layer only picks up the state of matching type, so they naturally don't cross-contaminate. That's why in example 4, "outer approval + inner graph interrupt" can each be restored sequentially and precisely.
+
+## Four orchestrations, four tool shapes
+
+The official example gives four progressive samples, neatly covering Part IV's three builders plus nested interrupts:
+
+<Callout kind="note" title="The four examples mapped">
+- **Chain as a summarizer tool**: `InvokableGraphTool` wrapping a linear Chain — the simplest shape.
+- **Graph for parallel research**: `StreamableGraphTool` wrapping a parallel fan-out Graph, paired with `ReturnDirectly` so streamed results reach the user directly.
+- **Workflow for order approval**: `InvokableGraphTool` wrapping a field-mapped Workflow, then wrapped once more by an approval wrapper.
+- **Two-layer nested interrupt**: an approval wrapper (state `string`) wrapping GraphTool (state `*graphToolInterruptState`), demonstrating sequential restoration of dual interrupts.
+
+All four share the same `graph_tool.go`; only the `Compilable` fed in differs — again proving "three expressivenesses grown from one foundation."
+</Callout>
+
+The streaming variant `StreamableGraphTool`'s `StreamableRun` structure is worth noting too: it immediately returns a `schema.Pipe[string](1)` reader, throws the real work into a goroutine, `MarshalString`s each chunk and `Send`s it; an interrupt can surface either before the stream starts or mid-stream at `Recv`, and both spots do the same capture-and-repack. That's how a "streaming tool" can both stream to the user as it goes and be interrupt-saved at any moment.
+
+## Chapter summary
+
+- GraphTool swallows Graph/Chain/Workflow through one narrow interface `Compilable` (<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:32" />) — **orchestration is the tool's implementation, the tool is orchestration's wrapper.**
+- The constructor's `GoStruct2ToolInfo` uses reflection to auto-turn the input struct into a tool JSON Schema; the graph is **compiled fresh on every call** (<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:77" />) to inject a private checkpoint store.
+- `InvokableRun` is essentially a bidirectional "JSON args ↔ typed input/output" translation plus one `runnable.Invoke`.
+- **Nested interrupts relay in three layers**: inner graph `StatefulInterrupt` → GraphTool packs the inner checkpoint into `graphToolInterruptState` with `CompositeInterrupt` (<SourceRef path="eino-examples/adk/common/tool/graphtool/graph_tool.go:134" />) → ToolsNode re-raises with an address; type isolation via generic `GetInterruptState[T]` keeps the layers from cross-contaminating.
+- The design key: this chapter is the book's "closed-loop proof" of layered design — ADK, compose, and components are not a one-way dependency but can wrap and fulfill one another.
+
+Next chapter we build a truly end-to-end Capstone: assembling indexing, retrieval, ReAct, memory, and a web UI into a complete RAG assistant, to see how these mechanisms mesh in a real application.

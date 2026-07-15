@@ -1,0 +1,87 @@
+## When one agent isn't enough
+
+A single agent that tries to do everything usually does nothing well: too many tools and it picks the wrong one, too long an instruction and it loses the point, knowledge from different domains interfering with each other. The natural fix is **division of labor** — split a big problem across several specialized agents.
+
+But *how multiple agents collaborate* hides the single most important design fork in this whole book. In this chapter we'll get both mainstream routes working once each and feel the difference firsthand; the next part (Chapter 9) elevates it into a full design debate.
+
+<Viz name="agent-tool-vs-transfer" />
+
+Follow the visualization above: **on the left is transfer**, where control is passed like a baton from one agent to another and everyone shares the same conversation context; **on the right is agent-as-tool**, where the main agent "calls" a sub-agent like an ordinary tool, the sub-agent runs to completion in an **isolated context**, and only its result comes back. These two topologies are the two routes this chapter gets working.
+
+## Route 1: Supervisor — central coordination
+
+The first route is the supervisor: a central supervisor agent does the dispatching, handing tasks to sub-agents, and sub-agents can only talk to the supervisor, never directly to each other. It's the classic hub-and-spoke structure.
+
+```go
+import "github.com/cloudwego/eino/adk/prebuilt/supervisor"
+
+sup, _ := supervisor.New(ctx, &supervisor.Config{
+    Supervisor: coordinatorAgent,          // the central dispatcher
+    SubAgents:  []adk.Agent{researcher, writer, reviewer}, // the specialists
+})
+
+runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: sup})
+iter := runner.Query(ctx, "Write a technical blog post about Eino")
+```
+
+Its constructor (<SourceRef path="adk/prebuilt/supervisor/supervisor.go:101" />) does one crucial thing: it wraps each sub-agent with `AgentWithDeterministicTransferTo`, forcing them to **transfer back to the supervisor** once done. That forms the loop "supervisor assigns → sub-agent works → hands back → supervisor decides again."
+
+<Callout kind="warning" title="The source marks Supervisor as NOT RECOMMENDED">
+Note that `supervisor.New`'s doc comment (<SourceRef path="adk/prebuilt/supervisor/supervisor.go:98" />) says **NOT RECOMMENDED** in plain text: supervisor is built on agent transfer + full context sharing, which hasn't proven more effective empirically, and the maintainers suggest `ChatModelAgent` + `AgentTool` or `DeepAgent` for most scenarios. Why is shared context a problem? That's precisely the core debate of Chapter 9. Let's get it running and feel it first, then understand why it's discouraged.
+</Callout>
+
+## Route 2: DeepAgent — agent as a tool
+
+The second route is DeepAgent, embodying the composition style Eino favors: use a sub-agent as a **tool**.
+
+```go
+import "github.com/cloudwego/eino/adk/prebuilt/deep"
+
+agent, _ := deep.New(ctx, &deep.Config{
+    Name:        "lead",
+    ChatModel:   chatModel,
+    Instruction: "You are the team lead; delegate subtasks to the right specialist.",
+    SubAgents:   []adk.Agent{researcher, writer, reviewer},
+})
+```
+
+The entry point is `deep.New` (<SourceRef path="adk/prebuilt/deep/deep.go:171" />, going through the generic `NewTyped` <SourceRef path="adk/prebuilt/deep/deep.go:116" /> internally). Its cleverness: the sub-agents aren't spread out as a pile of tools — they're collapsed into **one unified `task` tool** (the task tool middleware at <SourceRef path="adk/prebuilt/deep/deep.go:131" />). When the main agent wants to delegate, it calls `task`, which routes the subtask to the right specialist.
+
+The essential difference from supervisor: sub-agents execute in an **isolated context**, and the main agent sees only their final output, not their scattered intermediate drafts. That's the right-hand route of the visualization — clean input in, clean result out.
+
+<Callout kind="key" title="The design key for this chapter">
+The watershed between the two routes is the **boundary of context**. Supervisor soaks all agents in one shared context (transfer semantics), where each other's intermediate steps are mutually visible and mutually polluting; DeepAgent locks each sub-agent into an isolated context (agent-as-tool semantics), exchanging only "input → output." Isolation buys three things: **composability** (sub-agents can be nested and reused freely), **control** (the main agent isn't drowned in a sub-agent's noise), and **interrupt propagation** (an interrupt inside a sub-agent can pierce the tool boundary and bubble to the top — you'll see the implementation in Chapter 16). Hold onto this "boundary" intuition and Chapter 9's debate falls right into place.
+</Callout>
+
+## Route 3 (advanced): Plan-Execute-Replan
+
+Beyond these two mainlines, the ADK ships a third, more structured pattern: plan first, then execute, then replan as needed. Its constructor (<SourceRef path="adk/prebuilt/planexecute/plan_execute.go:862" />) actually assembles the orchestration primitives from earlier chapters:
+
+```go
+// Conceptual structure: Sequential(Planner, Loop(Executor, Replanner))
+peAgent, _ := planexecute.New(ctx, &planexecute.Config{
+    Planner:   planexecute.NewPlanner(ctx, ...),   // produce an actionable plan
+    Executor:  planexecute.NewExecutor(ctx, ...),  // execute the first step
+    Replanner: planexecute.NewReplanner(ctx, ...), // assess progress, revise or finish
+})
+```
+
+It's a `Sequential`: run `Planner` to produce a plan, then enter a `Loop` that repeatedly does "execute one step → replan." The `Replanner` (<SourceRef path="adk/prebuilt/planexecute/plan_execute.go:807" />), once it judges the task done, triggers `NewBreakLoopAction` via a `respond` tool to break out of the loop. It loops at most 10 times by default (<SourceRef path="adk/prebuilt/planexecute/plan_execute.go:851" />).
+
+The value of this pattern is the **explicit plan**: it suits tasks with many steps that need mid-course correction. It also confirms one thing — multi-agent isn't only about "who calls whom," but also about "how to orchestrate their timing." These three prebuilt agents (supervisor / DeepAgent / plan-execute) each embody a composition pattern, systematically compared in Chapter 11.
+
+## Two routes, build the feel first
+
+You've now gotten all three prebuilt multi-agent patterns running. Glance back at the opening visualization: transfer is "hand off control + share context," agent-as-tool is "call + isolate context." These aren't two equivalent spellings but two **worldviews** — they determine whether a system can compose, whether it can be controlled, whether interrupts can propagate.
+
+No need to render a verdict now. Part I's goal is "usage" and "feel"; we've walked the full throughline of single agent → tools → memory → interrupt/resume → middleware → multi-agent. Part II is where we formally enter the "why it's designed this way."
+
+## Chapter summary
+
+- When one agent falls short, use multi-agent **division of labor**; collaboration comes in two main routes.
+- **Supervisor** (<SourceRef path="adk/prebuilt/supervisor/supervisor.go:101" />): hub-and-spoke, shared context, transfer semantics — the source marks it **NOT RECOMMENDED**.
+- **DeepAgent** (<SourceRef path="adk/prebuilt/deep/deep.go:171" />): agent-as-tool, isolated context, sub-agents collapsed into a single `task` tool — the recommended route.
+- **Plan-Execute-Replan** (<SourceRef path="adk/prebuilt/planexecute/plan_execute.go:862" />): `Sequential(Planner, Loop(Executor, Replanner))`, explicit plan + replan on demand.
+- The watershed is the **boundary of context**: isolation buys composability, control, and interrupt propagation — the setup for Chapter 9's debate.
+
+That ends Part I. Next, we open the design proper: starting from the ADK worldview (Agent = event-stream generator), leading straight to the climax of the whole book — the composition debate.
